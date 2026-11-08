@@ -1,0 +1,8 @@
+# Keep the repo byte-stable regardless of core.autocrlf
+* text=auto eol=lf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.json text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+.gitignore text eol=lf

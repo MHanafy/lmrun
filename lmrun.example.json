@@ -1,0 +1,83 @@
+{
+  "$comment": "lmrun template. Copy this file to lmrun.json in the same folder, then edit engines and profiles. lmrun.json is git-ignored on purpose so local paths stay out of the repo.",
+
+  "default_engine": "local",
+  "default_profile": "default",
+
+  "log_dir": "%TEMP%\\lmrun",
+  "history": "runs.jsonl",
+
+  "engines": {
+    "local": {
+      "path": "C:\\path\\to\\llama-server.exe",
+      "version": null,
+      "family": "llama.cpp",
+      "version_args": ["--version"],
+      "log": {
+        "style": "kv",
+        "quiet_tags": ["cache", "slot", "metrics"],
+        "quiet_events_by_tag": {
+          "http": ["received", "completed", "cancelled", "stream", "started", "queued"]
+        }
+      },
+      "notes": "kv logs drive the throughput dashboard; if your engine logs free-form text set log.style to plain, or map its key names with log.fields"
+    },
+
+    "fake": {
+      "path": "python",
+      "version": null,
+      "family": "self-test",
+      "build": "deterministic stand-in",
+      "version_args": ["%LMRUN_HOME%\\fake_engine.py", "--version"],
+      "log": { "style": "kv" },
+      "notes": "no model and no port: streams fixed log lines so the dashboard can be checked safely"
+    },
+
+    "fake-plain": {
+      "path": "python",
+      "version": "9.9.9",
+      "family": "self-test",
+      "version_args": ["%LMRUN_HOME%\\fake_engine.py", "--version"],
+      "log": { "style": "plain" },
+      "notes": "same stand-in, treated as an engine whose logs are not key=value"
+    }
+  },
+
+  "$engine_template": {
+    "$comment": "Copy into engines for any llama.cpp-compatible server. Leave version null to read it from version_args. A bare command name (\"python\", \"llama-server\") is resolved through PATH; %LMRUN_HOME% expands to this folder. Logs that are not key=value: set log.style to plain (throughput stats need kv logs), or map the engine's names onto the ones lmrun reads, e.g. \"fields\": {\"generated_tokens\": \"predicted_per_second_tokens\", \"prefill_tokens\": \"prompt_evaluated\"}.",
+    "path": "C:\\path\\to\\engine.exe",
+    "version": null,
+    "family": "llama.cpp",
+    "version_args": ["--version"],
+    "log": { "style": "plain" }
+  },
+
+  "profiles": {
+    "default": {
+      "engine": "local",
+      "model": "my-model",
+      "notes": "one profile per model/quant you want to compare; anything extra here is ignored",
+      "args": [
+        "-m", "C:\\Models\\my-model-Q4_K_M.gguf",
+        "--alias", "my-model",
+        "--host", "127.0.0.1",
+        "--port", "8080",
+        "--ctx-size", "8192"
+      ]
+    },
+
+    "fake": {
+      "engine": "fake",
+      "model": "fake-model",
+      "notes": "eyeball the dashboard without loading a model: lmrun --profile fake",
+      "args": ["%LMRUN_HOME%\\fake_engine.py", "--max-requests", "40", "--interval", "0.5"]
+    },
+
+    "fake-plain": {
+      "engine": "fake-plain",
+      "model": "plain-model",
+      "notes": "log.style=plain: every line passes through and no throughput numbers are parsed",
+      "args": ["%LMRUN_HOME%\\fake_engine.py", "--plain", "--max-requests", "40", "--interval", "0.5"]
+    }
+  }
+}

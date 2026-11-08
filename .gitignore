@@ -1,0 +1,10 @@
+# local config: copy lmrun.example.json to lmrun.json; keeps machine paths private
+lmrun.json
+
+# run artifacts
+runs.jsonl
+*.log
+
+# python
+__pycache__/
+*.py[cod]
