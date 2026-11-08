@@ -117,8 +117,37 @@ local   b4521       12   318    3  341.2 t/s   46.7 t/s  99.4%  412.5k  my-model
 `--report` (or `--report path\to\runs.jsonl`) prints that table; aggregate the JSONL itself
 however you like afterwards. `--no-history` skips the write for throwaway runs.
 
-`runs.jsonl` is git-ignored because it grows with every run — `git add -f runs.jsonl` if you
-would rather keep the measured numbers versioned next to the code.
+`runs.jsonl` is git-ignored because it grows with every run and each record embeds your temp
+log path. To publish measured numbers, commit a `--report` dump instead:
+
+```
+run.cmd --report > bench.md      # aggregate table only, no local paths
+```
+
+## Local data stays local
+
+`lmrun.json`, `runs.jsonl` and `*.log` are git-ignored, so ordinary editing and pushing of the
+code never touches them: `git add -A`, `git commit`, `git push` and `git pull` skip ignored
+files, and `git status` does not even list them (`git status --ignored` does). Three things to
+keep in mind:
+
+* **Don't force-add.** `git add -f lmrun.json` is the one command that would publish your paths
+  and model names, so a `pre-commit` guard is worth installing locally (see below).
+* **`git clean -fdx` deletes them.** That command throws away ignored files, i.e. your config
+  and your measured history. Use `git clean -fd` (without `x`) if you ever need to tidy up.
+* **Nothing backs them up.** Since they are not in the repo, a fresh clone elsewhere needs a copy
+  of `lmrun.json` — keep it somewhere private, or point `LMRUN_CONFIG` at a file outside the repo
+  and set `history` there to a path of your own, leaving the working copy free of personal data.
+
+```sh
+# .git/hooks/pre-commit  (hooks are local; they are never pushed)
+#!/bin/sh
+staged=$(git diff --cached --name-only --diff-filter=ACMR | tr '\n' ' ')
+case " $staged " in
+  *" lmrun.json "*|*" runs.jsonl "*|*.log*) echo "local data staged - commit refused"; exit 1 ;;
+esac
+exit 0
+```
 
 ## Verifying without a model
 
