@@ -81,6 +81,27 @@ Per-request time is derived from the engine's own numbers:
 * Add another engine by copying the block in `"$engine_template"`, or skip the config
   entirely with `run.cmd --bin C:\path\to\llama-server.exe -- <args>`.
 
+### Restarting a dead engine (`restart`)
+
+Engines that exit with a defined "only a new process can recover" code — gufo exits `75`
+(`EX_TEMPFAIL`) when it detects a lost GPU context — can relaunch themselves:
+
+```jsonc
+"restart": {
+  "codes": [75],        // engine exit codes eligible for a restart (default: [75])
+  "max": 3,             // consecutive restarts before lmrun gives up
+  "delay_s": 15,        // pause before relaunch (let a flaky driver settle)
+  "reset_after_s": 1800 // an attempt that lived this long clears the consecutive counter
+}
+```
+
+Put it on an engine (all its profiles) or on a profile (wins). `"restart": true` means the
+defaults; `"restart": [75, 1]` is shorthand for `codes`. A restart banner goes to the log
+pane and the raw log (`event=restart` / `event=give_up`), the header counts restarts, and
+the history record gains a `restarts` field. Ctrl+C and `--replay` never restart. When the
+engine finally exits, lmrun exits with the engine's code, so a supervisor stacked on lmrun
+still sees `75`.
+
 ### Log shapes
 
 `log.style: "kv"` (default) expects `2026-11-08 11:15:48 [INFO] [tag] key=value ...`, which
@@ -157,7 +178,7 @@ fixed log lines. The shipped config registers it as `fake` (kv-style) and `fake-
 ```
 C:\src\lmrun\run.cmd --profile fake        watch the dashboard move (~20 s, Ctrl+C anytime)
 C:\src\lmrun\run.cmd --profile fake-plain  the same engine with log.style = plain
-C:\src\lmrun\run.cmd --self-test           25 automated checks, exit code 0 when all pass
+C:\src\lmrun\run.cmd --self-test           30 automated checks, exit code 0 when all pass
 ```
 
 `--self-test` writes its own scratch config in a temp folder, drives the fake engine through
@@ -195,6 +216,8 @@ your `runs.jsonl` is untouched; add `--keep-tmp` to inspect the scratch folder a
   the totals: uptime, requests, computed vs cached prefill, average t/s, cache hit rate,
   busy-vs-wall-clock time, draft acceptance and the last request. Engines flush log lines to
   pipes, so the dashboard keeps up in real time.
+* When the engine exits (and no `restart` policy takes over, see Configuration), lmrun exits
+  with the engine's own exit code; `130` stays reserved for Ctrl+C.
 * With `--replay`, "up" and "… ago" follow the timestamps inside the log rather than the
   clock on the wall, so old logs report what actually happened.
 * The pinned header uses a DEC scroll region; Windows Terminal and the Windows console both

@@ -16,10 +16,12 @@ real model. The numbers are fixed on purpose so the assertions stay exact:
 
 Usage
   fake_engine.py [--version] [--max-requests N] [--interval SECONDS]
-                 [--plain] [--no-errors]
+                 [--plain] [--no-errors] [--exit-code N]
 
   --plain  emit unstructured log lines instead of `ts [LEVEL] [tag] key=value`,
            which is how lmrun treats engines configured with log.style = "plain"
+  --exit-code N  finish with exit code N instead of 0 (drives lmrun's restart policy,
+                 where 75 is the device-lost code)
 """
 
 import sys
@@ -50,6 +52,9 @@ def main(argv):
         interval = float(argv[argv.index("--interval") + 1])
     plain = "--plain" in argv
     errors = "--no-errors" not in argv
+    exit_code = 0
+    if "--exit-code" in argv:
+        exit_code = int(argv[argv.index("--exit-code") + 1])
 
     def emit(text):
         print(f"{stamp()} {text}", flush=True)
@@ -61,7 +66,7 @@ def main(argv):
             print(f"{stamp()} fakellm : slot {i} processed 100 tokens at 50.00 t/s", flush=True)
             time.sleep(interval)
         print(f"{stamp()} fakellm : shutting down", flush=True)
-        return 0
+        return exit_code
 
     emit("[INFO] [gpu] event=queue_budget kind=llm observed=0 budget=8 expected_max=3 cap=2")
     emit("[INFO] [loader] event=load_started kind=text artifact=fake.gguf")
@@ -94,8 +99,12 @@ def main(argv):
                  f'error="upstream worker unavailable"')
         time.sleep(interval)
 
-    emit("[INFO] [http] event=shutdown reason=requests_exhausted")
-    return 0
+    reason = "requests_exhausted" if exit_code == 0 else f"exit_code_{exit_code}"
+    if exit_code == 75:  # mimic gufo's device-lost signature for the restart policy
+        emit("[ERROR] [scheduler] event=device_lost remedy=restart "
+             "reason=idle device probe failed")
+    emit(f"[INFO] [http] event=shutdown reason={reason}")
+    return exit_code
 
 
 if __name__ == "__main__":

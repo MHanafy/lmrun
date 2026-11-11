@@ -193,7 +193,8 @@ class Engine:
         # Anything else you put on the engine (build, hardware, quantisation, ...) is
         # carried into every history record, so reports can slice by it later.
         self.meta = {k: v for k, v in cfg.items()
-                     if k not in ("path", "version", "version_args", "log", "env", "notes")}
+                     if k not in ("path", "version", "version_args", "log", "env", "notes",
+                                  "restart")}
         self.extra = cfg.get("env", {}) or {}
         log = dict(LOG_DEFAULTS)
         log.update(cfg.get("log", {}) or {})
@@ -297,6 +298,48 @@ def int_arg(args: list, flag: str):
         return None
 
 
+# --------------------------------------------------------------------- restart policy
+
+RESTART_DEFAULTS = {"codes": (75,), "max": 3, "delay_s": 5.0, "reset_after_s": 900.0}
+
+
+def restart_policy(profile_raw, engine_raw):
+    """Restart budget from an optional `restart` key: profile wins over engine.
+
+    Shapes: `true` -> defaults (restart on exit 75, gufo's device-lost EX_TEMPFAIL);
+    `[75, 1]` -> list of eligible exit codes; or an object with keys `codes`,
+    `max` (consecutive restarts before giving up), `delay_s` (pause before
+    relaunch) and `reset_after_s` (an attempt that lived this long clears the
+    consecutive counter, so a crash loop stops but a healthy day does not).
+    Absent or `false` -> None: one attempt, the historical behaviour.
+    """
+    raw = None
+    for src in (profile_raw, engine_raw):
+        if isinstance(src, dict) and src.get("restart") is not None:
+            raw = src["restart"]
+    if raw is None or raw is False:
+        return None
+    if raw is True:
+        raw = {}
+    if isinstance(raw, (list, tuple)):
+        raw = {"codes": list(raw)}
+    if not isinstance(raw, dict):
+        print(f"{APP}: ignoring malformed restart config {raw!r}", file=sys.stderr)
+        return None
+    d = dict(RESTART_DEFAULTS)
+    try:
+        d["codes"] = frozenset(int(c) for c in raw.get("codes", d["codes"]))
+        d["max"] = int(raw.get("max", d["max"]))
+        d["delay_s"] = max(0.0, float(raw.get("delay_s", d["delay_s"])))
+        d["reset_after_s"] = float(raw.get("reset_after_s", d["reset_after_s"]))
+    except (TypeError, ValueError) as exc:
+        print(f"{APP}: ignoring malformed restart config ({exc})", file=sys.stderr)
+        return None
+    if not d["codes"] or d["max"] <= 0:
+        return None
+    return d
+
+
 # ---------------------------------------------------------------------------- parsing
 
 
@@ -379,6 +422,8 @@ class Stats:
         self.profile = profile
         self.family = family
         self.engine_meta = engine_meta or {}
+
+        self.restarts = 0  # engine relaunches by the restart policy (not counted as requests)
 
         self.done = 0
         self.errors = 0
@@ -542,6 +587,7 @@ class Stats:
             "acceptance_pct": round(self.accept_pct, 2) if self.accept_pct is not None else None,
             "last_request": self.last,
             "exit": exit_code,
+            "restarts": self.restarts,
             "log": log_path,
             "replay": replay,
         }
@@ -728,6 +774,8 @@ def render_header(st: Stats, cols: int) -> list[str]:
     active = f" {C.MAGENTA}{st.inflight}\u25b8{C.RESET}" if st.inflight else ""
     seg1.append(f"{label('reqs')} {C.BOLD}{st.done}{C.RESET}{active}"
                 + (f" {C.RED}{st.errors}err{C.RESET}" if st.errors else ""))
+    if st.restarts:
+        seg1.append(f"{label('restarts')} {C.YELLOW}{C.BOLD}{st.restarts}{C.RESET}")
     seg1.append(f"{label('prefill')} {tps(st.avg_prefill_tps, 300, 120)}{label(' avg')}")
     seg1.append(f"{label('generate')} {tps(st.avg_gen_tps, 45, 25)}{label(' avg')}")
     seg1.append(f"{label('tok')} {human(st.prefill_tokens)} {label('calc')} "
@@ -961,6 +1009,15 @@ def self_test(keep_tmp: bool = False) -> int:
                      "args": [fake, "--max-requests", "3"]},
             "fake-plain": {"engine": "fake-plain", "model": "plain-model",
                            "args": [fake, "--plain", "--max-requests", "2"]},
+            # crash-loop stand-ins: exit 75 is gufo's device-lost EX_TEMPFAIL
+            "fake-restart": {"engine": "fake", "model": "fake-crash",
+                             "args": [fake, "--max-requests", "1", "--interval", "0.05",
+                                      "--exit-code", "75"],
+                             "restart": {"codes": [75], "max": 2, "delay_s": 0.1}},
+            "fake-norestart": {"engine": "fake", "model": "fake-crash",
+                               "args": [fake, "--max-requests", "1", "--interval", "0.05",
+                                        "--exit-code", "9"],
+                               "restart": {"codes": [75], "max": 2, "delay_s": 0.1}},
         },
     }
     with open(cfg_path, "w", encoding="utf-8") as fh:
@@ -1034,6 +1091,22 @@ def self_test(keep_tmp: bool = False) -> int:
 
     out, _, rc = run("--config", cfg_path, "--list")
     check("--list shows both engines", rc == 0 and "fake-plain" in out and "self-test" in out)
+
+    out, _, rc = run("--config", cfg_path, "--profile", "fake-restart", "--size", "40x150",
+                     "--color")
+    check("device-lost exit restarts the engine", "restart 1 of 2" in out
+          and "restart 2 of 2" in out, f"rc={rc}")
+    check("restart budget exhausts and gives up", "giving up" in out, f"rc={rc}")
+    check("engine exit code becomes lmrun's", rc == 75, f"rc={rc}")
+    if os.path.exists(hist):
+        with open(hist, "r", encoding="utf-8") as fh:
+            last_rec = json.loads([l for l in fh if l.strip()][-1])
+        check("history counts the restarts", last_rec.get("restarts") == 2
+              and last_rec.get("exit") == 75, str(last_rec.get("restarts")))
+    out, _, rc = run("--config", cfg_path, "--profile", "fake-norestart", "--size", "40x150",
+                     "--color", "--no-history")
+    check("exit code outside codes never restarts", rc == 9 and "engine exited" not in out,
+          f"rc={rc}")
 
     shutil.rmtree(tmp, ignore_errors=not keep_tmp)
     failed = results.count(False)
@@ -1179,102 +1252,159 @@ def main(argv=None) -> int:
 
     stats = Stats(time.monotonic(), context, model, engine.name, engine.version or "",
                   profile.name or "", engine.family, engine.meta)
-    q: queue.Queue = queue.Queue()
+    policy = restart_policy(
+        (cfg.get("profiles", {}) or {}).get(profile.name) if profile.name else None,
+        (cfg.get("engines", {}) or {}).get(engine.name))
 
     proc = None
     cmd = engine.launch_argv(eng_args) if not opts.replay else None
+    child_in = None
+    env, creationflags = None, 0
     if opts.replay:
         child_in = open(opts.replay, "r", encoding="utf-8", errors="replace")
-        threading.Thread(target=read_lines, args=(child_in, q), daemon=True).start()
     else:
         env = dict(os.environ)
         env.update({str(k): str(v) for k, v in (engine.extra or {}).items()})
         creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
-                env=env,
-                creationflags=creationflags,
-            )
-        except OSError as exc:
-            print(f"{APP}: cannot start {engine.path}: {exc}", file=sys.stderr)
-            if tee:
-                tee.close()
-            return 2
-        threading.Thread(target=read_lines, args=(proc.stdout, q), daemon=True).start()
-        if not use_tui:
-            print(f"{C.DIM}{APP}: {engine.label()} pid {proc.pid}  raw log -> {log_path or 'off'}{C.RESET}")
 
     rc = 0
+    consecutive = 0  # restarts since the last attempt that lived long enough
     try:
         if screen:
             screen.start()
             screen.set_header(render_header(stats, cols))
-        eof = False
-        while not eof:
-            try:
-                kind, line = q.get(timeout=0.5)
-            except queue.Empty:
-                if screen:
-                    if proc and proc.poll() is not None and q.empty():
-                        break
-                    screen.set_header(render_header(stats, cols))  # tick uptime / age
-                continue
-            if kind == "eof":
-                eof = True
-                continue
-            if tee:
-                tee.write(line + "\n")
-                tee.flush()
-
-            parsed = rules.parse(line)
-            sev = tag = ""
-            fields = {}
-            when = None
-            if parsed:
-                sev, tag, fields, when = parsed
-                stats.note_time(when)
-                event = fields.get("event")
-                if event in rules.received:
-                    stats.add_received()
-                elif event in rules.finish:
-                    stats.finish_inflight()
-                    if event in rules.completed:
-                        stats.add_completed(fields, when)
-                    else:
-                        stats.note_status(fields.get("status"), fields.get("request"))
-
-            completed = bool(parsed) and fields.get("event") in rules.completed
-            if completed and opts.summaries:
-                text, show_line = summary_line(line, stats.last or {}), True
-            elif opts.all:
-                text, show_line = line, True
-            elif parsed is None:
-                text, show_line = line, True  # banners, tracebacks, unknown formats
+        while True:  # engine attempts; one pass unless a restart policy is armed
+            # Fresh queue per attempt: the previous reader's eof marker can never
+            # end the next attempt before its own log does.
+            q: queue.Queue = queue.Queue()
+            if opts.replay:
+                threading.Thread(target=read_lines, args=(child_in, q), daemon=True).start()
             else:
-                text, show_line = line, not rules.is_quiet(sev, tag, fields, line)
+                try:
+                    proc = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        stdin=subprocess.DEVNULL,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        bufsize=1,
+                        env=env,
+                        creationflags=creationflags,
+                    )
+                except OSError as exc:
+                    print(f"{APP}: cannot start {engine.path}: {exc}", file=sys.stderr)
+                    rc = 2
+                    break
+                threading.Thread(target=read_lines, args=(proc.stdout, q), daemon=True).start()
+                if not use_tui:
+                    print(f"{C.DIM}{APP}: {engine.label()} pid {proc.pid}  raw log -> "
+                          f"{log_path or 'off'}{C.RESET}")
 
-            if show_line:
-                if screen:
-                    screen.print_line(text)
+            attempt_started = time.monotonic()
+            eof = False
+            while not eof:
+                try:
+                    kind, line = q.get(timeout=0.5)
+                except queue.Empty:
+                    if screen:
+                        if proc and proc.poll() is not None and q.empty():
+                            break
+                        screen.set_header(render_header(stats, cols))  # tick uptime / age
+                    continue
+                if kind == "eof":
+                    eof = True
+                    continue
+                if tee:
+                    tee.write(line + "\n")
+                    tee.flush()
+
+                parsed = rules.parse(line)
+                sev = tag = ""
+                fields = {}
+                when = None
+                if parsed:
+                    sev, tag, fields, when = parsed
+                    stats.note_time(when)
+                    event = fields.get("event")
+                    if event in rules.received:
+                        stats.add_received()
+                    elif event in rules.finish:
+                        stats.finish_inflight()
+                        if event in rules.completed:
+                            stats.add_completed(fields, when)
+                        else:
+                            stats.note_status(fields.get("status"), fields.get("request"))
+
+                completed = bool(parsed) and fields.get("event") in rules.completed
+                if completed and opts.summaries:
+                    text, show_line = summary_line(line, stats.last or {}), True
+                elif opts.all:
+                    text, show_line = line, True
+                elif parsed is None:
+                    text, show_line = line, True  # banners, tracebacks, unknown formats
                 else:
-                    sys.stdout.write(text + "\n")
-                    sys.stdout.flush()
+                    text, show_line = line, not rules.is_quiet(sev, tag, fields, line)
 
-            if screen:
-                if completed:
-                    screen.set_header(render_header(stats, cols))
-                if not opts.size:
-                    r, c = term_size()
-                    if (r, c) != (screen.rows, screen.cols):
-                        screen.resize(r, c)
+                if show_line:
+                    if screen:
+                        screen.print_line(text)
+                    else:
+                        sys.stdout.write(text + "\n")
+                        sys.stdout.flush()
+
+                if screen:
+                    if completed:
+                        screen.set_header(render_header(stats, cols))
+                    if not opts.size:
+                        r, c = term_size()
+                        if (r, c) != (screen.rows, screen.cols):
+                            screen.resize(r, c)
+
+            engine_rc = 0 if opts.replay else proc.wait()
+            if opts.replay:
+                break
+            if policy is not None and engine_rc in policy["codes"]:
+                if time.monotonic() - attempt_started >= policy["reset_after_s"]:
+                    consecutive = 0  # a healthy long run is not part of a crash loop
+                if consecutive < policy["max"]:
+                    consecutive += 1
+                    stats.restarts += 1
+                    banner = (f"{C.YELLOW}{APP}: engine exited with code {engine_rc}; "
+                              f"restart {consecutive} of {policy['max']} in "
+                              f"{policy['delay_s']:.0f}s{C.RESET}")
+                    if tee:
+                        tee.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [WARN] [lmrun] "
+                                  f"event=restart exit={engine_rc} restart={consecutive} "
+                                  f"max={policy['max']} delay_s={policy['delay_s']:.1f}\n")
+                        tee.flush()
+                    if screen:
+                        screen.print_line(banner)
+                    else:
+                        sys.stdout.write(banner + "\n")
+                        sys.stdout.flush()
+                    deadline = time.monotonic() + policy["delay_s"]
+                    while time.monotonic() < deadline:
+                        time.sleep(0.2)
+                        if screen:
+                            screen.set_header(render_header(stats, cols))
+                    continue
+                banner = (f"{C.RED}{APP}: engine exited with code {engine_rc}; restart "
+                          f"budget ({policy['max']}) used up, giving up{C.RESET}")
+                if tee:
+                    tee.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [ERROR] [lmrun] "
+                              f"event=give_up exit={engine_rc} restarts={stats.restarts}\n")
+                    tee.flush()
+                if screen:
+                    screen.print_line(banner)
+                else:
+                    sys.stdout.write(banner + "\n")
+                    sys.stdout.flush()
+            # The engine's own exit code becomes lmrun's, so a supervisor stacked
+            # on lmrun (or a scripted caller) still sees e.g. 75 = device_lost.
+            rc = engine_rc
+            break
     except KeyboardInterrupt:
         if screen:
             screen.print_line(f"{C.YELLOW}^C interrupting {engine.name}\u2026{C.RESET}")

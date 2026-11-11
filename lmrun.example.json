@@ -44,7 +44,7 @@
   },
 
   "$engine_template": {
-    "$comment": "Copy into engines for any llama.cpp-compatible server. Leave version null to read it from version_args. A bare command name (\"python\", \"llama-server\") is resolved through PATH; %LMRUN_HOME% expands to this folder. Logs that are not key=value: set log.style to plain (throughput stats need kv logs), or map the engine's names onto the ones lmrun reads, e.g. \"fields\": {\"generated_tokens\": \"predicted_per_second_tokens\", \"prefill_tokens\": \"prompt_evaluated\"}.",
+    "$comment": "Copy into engines for any llama.cpp-compatible server. Leave version null to read it from version_args. A bare command name (\"python\", \"llama-server\") is resolved through PATH; %LMRUN_HOME% expands to this folder. Logs that are not key=value: set log.style to plain (throughput stats need kv logs), or map the engine's names onto the ones lmrun reads, e.g. \"fields\": {\"generated_tokens\": \"predicted_per_second_tokens\", \"prefill_tokens\": \"prompt_evaluated\"}. For an engine that exits with a recoverable code when its GPU context dies (gufo: 75 = device_lost), add e.g. \"restart\": {\"codes\": [75], \"max\": 3, \"delay_s\": 15, \"reset_after_s\": 1800} to relaunch it; a profile may override it.",
     "path": "C:\\path\\to\\engine.exe",
     "version": null,
     "family": "llama.cpp",
