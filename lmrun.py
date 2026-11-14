@@ -304,7 +304,7 @@ RESTART_DEFAULTS = {"codes": (75,), "max": 3, "delay_s": 5.0, "reset_after_s": 9
 
 
 def restart_policy(profile_raw, engine_raw):
-    """Restart budget from an optional `restart` key: profile wins over engine.
+    """Restart budget from an optional `restart` key: engine wins over profile.
 
     Shapes: `true` -> defaults (restart on exit 75, gufo's device-lost EX_TEMPFAIL);
     `[75, 1]` -> list of eligible exit codes; or an object with keys `codes`,
