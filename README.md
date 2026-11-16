@@ -223,6 +223,21 @@ your `runs.jsonl` is untouched; add `--keep-tmp` to inspect the scratch folder a
 * The pinned header uses a DEC scroll region; Windows Terminal and the Windows console both
   handle it. Non-tty output falls back to plain text automatically.
 
+## Companion: the awake keep-running skill
+
+`skills/awake/` ships the [opencode](https://opencode.ai) skill this workflow relies on for
+long unattended runs on Windows laptops with Modern Standby - machines that freeze or suspend
+compute the moment the display turns off (which is exactly when nobody is watching a
+transcription). It arms a timed PowerToys Awake window plus a detached black pixel-overlay
+process whose `SetThreadExecutionState` hold is the authoritative protection - the overlay
+blacks an OLED without ever asking Windows to power the display down, so neither the OS nor
+the GPU driver engages its screen-off power policy. Includes the renewal-loop timer the agent
+runs as a background job, and `TUNING-NOTES.md` documents the measurement methodology
+(heartbeat probes, Kernel-Power 506/566 events, elevated `powercfg /requests`) that produced
+every number in it. The tuning is Windows 11 + AMD APU + PowerToys specific; treat it as a
+worked example of how to diagnose your own machine. Install by placing the folder under
+`~\.config\opencode\skills\awake`.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
