@@ -65,8 +65,11 @@ cut mid-`KEEPALIVE`, no `EXIT`, zero WER/event-log traces, OS running the whole
 time, no Kernel-Power 506 anywhere near the deaths): NOT standby - the agent
 harness reaps its shell's **process tree** when the session that ran `start`
 ends, and the old in-tree `Process.Start` worker was a child of that shell.
+The old in-tree ShellExecute spawn was a child of the agent shell, so harness tree-reaping took it.
 Fix (v6.2): the worker is spawned **out-of-tree via WMI `Win32_Process.Create`**
-(parent = `WmiPrvSE.exe`, no shared console/job; verify with
+(parent = `WmiPrvSE.exe`, no shared console/job). The exe is console-subsystem (the CLI needs
+stdout) so the WMI call passes `Win32_ProcessStartup.ShowWindow = 0` (SW_HIDE) - otherwise the
+worker shows a console window; `status` is the UI and `MainWindowHandle` is 0. Verify the parent with
 `Get-CimInstance Win32_Process -Filter "ProcessId=<pid>"`), with the old
 ShellExecute spawn kept only as fallback; `awake.log` records
 `[cli] worker spawned via wmi (out-of-tree)` (or `shell ... FALLBACK`) per arm.

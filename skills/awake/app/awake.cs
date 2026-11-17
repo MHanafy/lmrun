@@ -327,8 +327,12 @@ single-file skipped per operator: extraction/startup overhead.) During developme
                 dynamic svc = locator.ConnectServer(".", "root\\cimv2");
                 dynamic wmiProc = svc.Get("Win32_Process");
                 string cmd = "\"" + exe + "\" " + string.Join(" ", args.Select(a => a.Contains(' ') ? "\"" + a + "\"" : a));
-                object? r = wmiProc.Create(cmd, Path.GetDirectoryName(exe), null, null); // dispatch returns ReturnValue
-                if (r == null || Convert.ToInt32(r, CultureInfo.InvariantCulture) == 0) return "wmi (out-of-tree)";
+                // The exe is console-subsystem (the CLI needs stdout); WMI would hand it a VISIBLE
+                // allocated console (seen 2026-11-18) - STARTF_USESHOWWINDOW/SW_HIDE keeps it off-screen.
+                dynamic startup = svc.Get("Win32_ProcessStartup").SpawnInstance_();
+                startup.ShowWindow = 0; // SW_HIDE
+                object? r = wmiProc.Create(cmd, Path.GetDirectoryName(exe), startup, null); // dispatch returns ReturnValue
+                if (r == null || Convert.ToInt32(r, CultureInfo.InvariantCulture) == 0) return "wmi (out-of-tree, hidden)";
             }
         }
         catch { }
