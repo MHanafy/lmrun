@@ -7,20 +7,35 @@ Usage:
   awake.ps1 on 90      # timed: auto-release after 90 minutes (+ agent renewal loop, see below)
   awake.ps1 off        # normal power behavior (default); terminates any pending renewal timer
   awake.ps1 status     # report awake + dark + renewal-timer state
-  awake.ps1 dark       # fullscreen black PIXEL overlay (v4): pixels off,
-                       # display logically ON (avoids driver screen-off
-                       # throttling); brightness untouched on the normal path
-  awake.ps1 light      # stop dark screensaver + repair net (sensor, brightness)
+  awake.ps1 dark       # dark screensaver (v6): black pixels NOW - the panel is
+                       # a verified OLED (Samsung ATNA33AA08-0 / SDC41B0), so
+                       # black pixels = zero light at any brightness setting;
+                       # the process injects a no-op F15 every
+                       # HeartbeatSeconds while dark - THIS keepalive is what
+                       # keeps the box out of Modern Standby (ES holds cannot
+                       # on this build); HUMAN input wakes (injected events are
+                       # filtered), re-blanks after $IdleSeconds real idle;
+                       # brightness/sensor NEVER touched (v7 experiment with
+                       # WMI backlight writes was reverted 2026-11-17 - they
+                       # sync into the plan and strand a dim panel)
+  awake.ps1 light      # stop dark screensaver (= stop the keepalive) and any
+                       # pending renewal timer
 
 Notes:
-- dark is a screensaver: black immediately (pure pixels - OLED black pixels
-  emit no light), any input wakes, re-blanks after $IdleSeconds idle
-  (default 180), and retires on its own when Minutes is given; normal exits
-  self-restore. 'light' is the safety-net stop. v5 (2026-11-16, operator
-  decision): brightness and the ambient-light sensor are NEVER touched -
-  black pixels + the overlay's ES hold are the whole mechanism, so state
-  cannot outlive the process (a kill strands nothing). Accepted trade: the
-  LOCK SCREEN stays lit when locked (locked-session speed parity unaffected).
+- dark is a screensaver: black immediately, any human input wakes, re-blanks
+  after $IdleSeconds idle (default 180), retires on its own when Minutes is
+  given; normal exits self-restore; 'light' is the stop. The panel is a
+  VERIFIED OLED (Win32_ComputerSystem ASUS ProArt PX13 HN7306EAC; WmiMonitorID
+  SDC41B0 = Samsung ATNA33AA08-0): black pixels emit NO light, so the overlay
+  is genuinely ZERO LIGHT and no brightness/sensor involvement is needed or
+  wanted. The v7 experiment (2026-11-17) that floored the WMI backlight was
+  REVERTED the same day - WmiSetBrightness SYNCs into the plan brightness
+  setting (observed 53->0), creating a stranded-dim-panel class we keep
+  structurally impossible: nothing persists outside the overlay process, a
+  kill strands nothing. Accepted trade: the LOCK SCREEN shows content
+  (clock/wallpaper = lit pixels) - zero-light unattended means DO NOT LOCK
+  (see SKILL.md doctrine; locked sessions still keep protection + full speed,
+  just not darkness).
 - dark does NOT arm the lock guard anymore (default since 2026-11-10): a locked
   session keeps full speed while the overlay holds its execution request
   (measured parity 10.3-10.6 vs 10.2-10.7 s per 90 s ASR clip, zero standby
@@ -52,6 +67,10 @@ param(
 
     [int]$IdleSeconds = 180,
 
+    # v6 (2026-11-17): no-op input keepalive cadence while dark - THE actual
+    # keep-awake mechanism on this S0ix build (ES holds do not stop Modern Standby).
+    [int]$HeartbeatSeconds = 30,
+
     [switch]$LockGuard,    # opt-in elevated insurance (one UAC): hold display ON if locked
     [switch]$NoLockGuard   # deprecated: this is the default now; accepted and ignored
 )
@@ -63,8 +82,15 @@ $darkFile = Join-Path $env:LOCALAPPDATA 'Microsoft\PowerToys\Awake\darkstate.jso
 function Get-Brightness {
     (Get-CimInstance -Namespace root\WMI -ClassName WmiMonitorBrightness).CurrentBrightness
 }
-# v5: brightness SETTERS removed (operator decision 2026-11-16) - dark never
-# writes brightness; the read above is informational for `status` only.
+# Brightness SETTERS stay out (operator decision 2026-11-16, re-confirmed
+# 2026-11-17 after reverting the v7 experiment): dark never writes brightness
+# or touches the ambient sensor. The read above is informational for `status`.
+# The v7 detour PROVED why: WmiSetBrightness SYNCs into the plan (VIDEONORMAL-
+# LEVEL followed a 53->0 write), so a killed overlay could strand a dim panel
+# across reboots - and on this VERIFIED OLED panel (SDC41B0 = Samsung
+# ATNA33AA08-0) it buys nothing anyway: black pixels emit no light. The GUIDs
+# (aded5e82 plan brightness / fbd9aa66 ADAPTBRIGHT) and v4 machinery remain
+# documented in TUNING-NOTES.md. Do not reintroduce setters here.
 function Get-DarkState {
     if (-not (Test-Path $darkFile)) { return $null }
     $st = Get-Content $darkFile -Raw | ConvertFrom-Json
@@ -72,10 +98,9 @@ function Get-DarkState {
     [pscustomobject]@{ state = $st; overlayAlive = $alive }
 }
 
-# v5 (2026-11-16): powercfg/registry/WMI brightness helpers REMOVED per
-# operator decision - dark never touches brightness or the ambient sensor.
-# The verified GUIDs and the v4 sensor-pause/restore machinery are recorded
-# in TUNING-NOTES.md should they ever be needed again.
+# The verified GUIDs and the v4 sensor-pause/restore machinery (and the v7
+# revert story) are recorded in TUNING-NOTES.md. No powercfg/WMI write helpers
+# belong in this script - darkness here is made of pixels, not settings.
 $guardFile = Join-Path $env:LOCALAPPDATA 'Microsoft\PowerToys\Awake\lockguard-state.json'
 function Get-GuardState {
     if (-not (Test-Path $guardFile)) { return $null }
@@ -144,8 +169,8 @@ if ($Action -eq 'status') {
     }
     $d = Get-DarkState
     if ($d) {
-        if ($d.overlayAlive) { Write-Output "Dark: screensaver RUNNING (idle $($d.state.idleSeconds) s, duration $(if ($d.state.durationMinutes) { "$($d.state.durationMinutes) min" } else { 'none' })$(if ($d.state.until) { ", retiring ~$($d.state.until)" }))" }
-        else { Write-Output 'Dark: overlay exited (stale journal; light or the next arm cleans it)' }
+        if ($d.overlayAlive) { Write-Output "Dark: screensaver RUNNING - keepalive active (idle cycle $($d.state.idleSeconds) s, nudge every $(if ($d.state.heartbeatSeconds) { "$($d.state.heartbeatSeconds) s" } else { 'v5 - none! overlay cannot keep this box awake' })$(if ($d.state.humanHook -eq $false) { ', WARNING human hook dead' }), duration $(if ($d.state.durationMinutes) { "$($d.state.durationMinutes) min" } else { 'none' })$(if ($d.state.until) { ", retiring ~$($d.state.until)" }))" }
+        else { Write-Output 'Dark: overlay exited - PROTECTION IS GONE (stale journal; light or the next arm cleans it)' }
     }
     $g = Get-GuardState
     if ($g) {
@@ -165,9 +190,9 @@ if ($Action -eq 'status') {
 if ($Action -eq 'dark') {
     $d = Get-DarkState
     if ($d -and $d.overlayAlive) { Write-Output 'Dark already ON.'; return }
-    # Stale journal (previous overlay force-killed): v5 state cannot outlive
-    # the process - the ES hold died with it and brightness/sensor were never
-    # touched, so cleaning the file IS the full repair.
+    # Stale journal (previous overlay force-killed): state cannot outlive the
+    # process - the ES hold died with it and brightness/sensor are never touched,
+    # so cleaning the file IS the full repair.
     $heal = ''
     if ($d) { Remove-Item -Path $darkFile -Force -ErrorAction SilentlyContinue; $heal = 'stale journal cleaned (nothing else can be stranded)' }
     # Lock guard is OPT-IN (-LockGuard): with the overlay's ES hold live a locked
@@ -218,7 +243,7 @@ if ($Action -eq 'dark') {
     # BEFORE the first blackout - poll for it instead of writing a pre-spawn state.
     $cmdArgs = @(
         '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $PSScriptRoot 'darkscreen.ps1'),
-        '-IdleSeconds', "$IdleSeconds"
+        '-IdleSeconds', "$IdleSeconds", '-HeartbeatSeconds', "$HeartbeatSeconds"
     )
     if ($Minutes) { $cmdArgs += @('-DurationMinutes', "$Minutes") }
     $proc = Start-Process pwsh -PassThru -WindowStyle Hidden -ArgumentList $cmdArgs
@@ -233,7 +258,7 @@ if ($Action -eq 'dark') {
     if (-not $j) {
         Write-Output "Dark screensaver started (pid $($proc.Id), $dur) - WARNING: no journal within 12 s; check darkscreen.log."
     } else {
-        Write-Output "Dark screensaver ON - pixel black now (brightness/sensor untouched), any input wakes, re-blanks after $IdleSeconds s idle ($dur)."
+        Write-Output "Dark screensaver ON - pixel black now (OLED: zero light; brightness/sensor untouched), F15 keepalive every $HeartbeatSeconds s holds off Modern Standby, human input wakes, re-blanks after $IdleSeconds s real idle ($dur)."
     }
     Write-Output $guardMsg
     return
@@ -241,13 +266,17 @@ if ($Action -eq 'dark') {
 
 if ($Action -eq 'light') {
     $done = @()
+    # v6: release is self-contained in 'light' - the overlay's input keepalive IS
+    # the protection, so stopping it and stopping the renewal loop belong together.
+    $renewStop = Stop-RenewTimer
+    if ($renewStop) { $done += $renewStop }
     $d = Get-DarkState
     if ($d) {
         Stop-Process -Id $d.state.pid -Force -ErrorAction SilentlyContinue
         Remove-Item -Path $darkFile -Force -ErrorAction SilentlyContinue
-        # v5: the ES hold died with the process and brightness/sensor were
-        # never touched - stopping the overlay IS the full restore.
-        $done = @('dark screensaver stopped (nothing else to restore)')
+        # The ES hold died with the process and brightness/sensor were never
+        # touched - stopping the overlay IS the full restore.
+        $done += 'dark screensaver stopped (nothing else to restore)'
     } else {
         $done += 'Dark mode was not on (brightness untouched)'
     }
@@ -314,5 +343,5 @@ $mode = switch ($p.mode) {
 }
 Write-Output "Awake: $mode$(if ($renewNote) { " ($renewNote)" })"
 if ($Action -eq 'on' -and $Minutes) {
-    Write-Output "Renewal loop: start as a background job NOW: pwsh -NoProfile -ExecutionPolicy Bypass -File `"$PSScriptRoot\renewtimer.ps1`" -Minutes $Minutes - when it fires: still working => re-run this 'on' command and start the next timer; finished => release (off)."
+    Write-Output "Renewal loop: start as a background job NOW: pwsh -NoProfile -ExecutionPolicy Bypass -File `"$PSScriptRoot\renewtimer.ps1`" -Minutes $Minutes - when it fires: still working => re-run this 'on' command and start the next timer; finished => release. NEVER re-run 'dark' as a renewal - 'on' extends a live overlay via its 'until' mailbox; re-arming 'dark' risks blacking the screen while the operator is at the machine."
 }

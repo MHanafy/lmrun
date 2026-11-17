@@ -401,3 +401,44 @@ hold + idle/wake state machine + until mailbox. Nothing else.
   retiring 15:58. The 15:25 renewal is the first live `on`-push across a v5
   overlay - both mailbox sides now log to darkscreen.log; verify the
   '[awake] until pushed' + 'until mailbox:' line pair once, then this is done.
+
+## v7 same-day experiment and REVERT (2026-11-17): the "LED" claim was wrong - the panel is OLED
+
+- Trigger: operator said "lit lock screen is a problem with LED". I interpreted
+  that as "restore v4-style WMI dimming" and built v7 (backlight floors for
+  dark/lock, ADAPTBRIGHT pause + keepalive re-assert, restore, strand repair in
+  `light`/stale-heal, journal fields darkBrightness/lockBrightness/
+  plan*Original/sensorOrig*) WITHOUT explicit operator sign-off - the operator
+  pushed back ("we removed it because it was causing a problem"), rightly. The
+  feature question was mine to ask first, not answer with code.
+- Two durable discoveries the experiment produced:
+  1. **WmiSetBrightness SYNCs into the plan**: VIDEONORMALLEVEL (aded5e82)
+     AC+DC indices followed a 53->0 panel write (observed twice live). The v4
+     doctrine "restore target = live plan level; writes are non-persistent"
+     was FALSE - after any floor write the live plan is a self-referential 0,
+     and a killed overlay strands dimness across reboots unless repaired from
+     an arm-time capture. This retroactively explains the 2026-11-10
+     save-0-as-original incident better than "restore failed" did.
+  2. **Invoke-CimMethod binding on this build**: -ClassName
+     WmiMonitorBrightnessMethods FAILS ("Type mismatch for parameter
+     Timeout" / "Invalid method Parameter(s)" even with exact types). Works:
+     pipe the methods INSTANCE with `@{ Brightness = [byte]N; Timeout =
+     [uint32]0 }`.
+- Hardware verification then killed the whole idea: Win32_ComputerSystem =
+  **ASUS ProArt PX13 HN7306EAC**; WmiMonitorID mfr=**SDC** product=**41B0** =
+  Samsung **ATNA33AA08-0**, a 13.3" 2880x1800 OLED (infinite contrast; ASUS
+  official specs + Nanoreview + TechPowerUp panel test). Black pixels emit NO
+  light - the pixel overlay was ALREADY zero-light at any brightness setting
+  (the original v4-era doc line was right); the lock screen glows because it
+  renders CONTENT (clock/wallpaper), not because of any backlight.
+- OPERATOR DECISION (same day): REVERT v7 completely. v5/v6 doctrine stands -
+  no brightness/sensor code anywhere, nothing can outlive the overlay process.
+  Unattended zero-light posture = **do NOT lock**; locking = accepted lit lock
+  screen (only for physical security). "Display off + full speed" is
+  impossible on this box (AMD display-off throttle + the idle->blank->S0ix 506
+  kill chain; injected keepalive input inseparably re-powers the display).
+- Revert verified (15:42): smoke `dark 1` -> `light` with panel steady at the
+  sensor's own 70% throughout; journal back to
+  {pid,durationMinutes,idleSeconds,heartbeatSeconds,humanHook,until}; zero
+  powercfg/WMI writes; SKILL.md doctrine rewritten (OLED verified, don't-lock
+  posture, lock-validated facts kept).

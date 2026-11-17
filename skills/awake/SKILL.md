@@ -5,31 +5,39 @@ description: Toggle this PC's keep-awake state (PowerToys Awake) so long AI jobs
 
 # Awake (screen-off keep-running toggle + dark screensaver)
 
-This machine uses Modern Standby: when the display turns off, Windows freezes
-compute (measured signature: ~3x slowdown, then full suspend). The hold that
-counts is the execution request the `dark` overlay process makes for its whole
-life - `status` showing the screensaver RUNNING is the authoritative proof of
-protection. The PowerToys Awake toggle is a supplement that only engages if
-the machine is already awake when its settings file is written (2026-11-10:
-armed while the box was dozing, PowerToys never applied it, and a freeze-
-suspend landed 59 s after the overlay was stopped; if the machine may already
-be dozing, run a short command to wake it, then arm). The AMD driver also
-runs a lower power policy whenever the display is logically off, so `dark`
-keeps the display ON and makes it black with an OLED overlay instead.
+This machine uses Modern Standby (S0ix): when the display turns off, Windows
+freezes compute and, during those idle-standby episodes, SILENTLY KILLS
+background processes - measured 2026-11-17: no WER event, no exit log, journal
+left behind; reproduced with decoy processes AND with the overlay itself while
+its execution-request hold was armed. The v5 idea that the ES hold was "the
+authoritative proof of protection" is FALSE on this build: ES_SYSTEM/AWAYMODE
+do not stop Modern-Standby entry, and the only flag that would
+(ES_DISPLAY_REQUIRED) is rejected here (err 87 - display power is OS-owned).
+The real mechanism since v6: the `dark` overlay injects a no-op F15 keypress
+every 30 s while darkened. Injected input resets the system idle timers, so
+the display never blanks and Modern Standby never engages - `status` showing
+the screensaver RUNNING (and a growing KEEPALIVE count in darkscreen.log) is
+the proof of protection, verified by the ABSENCE of Kernel-Power 506 events.
+The PowerToys Awake toggle remains as a nominal window holder / harmless
+redundancy (if the machine may already be dozing, run a short command to wake
+it before arming). The AMD driver also runs a lower power policy whenever the display
+is logically off, so `dark` keeps the display ON (via the keepalive) and makes
+it black with an OLED overlay instead.
 
 ## Tool
 
 Run the bundled script (same directory as this skill file):
 
 ```powershell
-& "$HOME\.config\opencode\skills\awake\awake.ps1" on        # indefinite, screen still blanks
-& "$HOME\.config\opencode\skills\awake\awake.ps1" on 90     # timed: auto-release after 90 minutes
-& "$HOME\.config\opencode\skills\awake\awake.ps1" off       # normal power behavior (default)
-& "$HOME\.config\opencode\skills\awake\awake.ps1" status    # report current mode
-& "$HOME\.config\opencode\skills\awake\awake.ps1" dark      # dark screensaver: black now (pure black pixels - brightness untouched), any input wakes, re-blanks after 180 s idle (override: -IdleSeconds N)
-& "$HOME\.config\opencode\skills\awake\awake.ps1" dark 90   # ...and auto-retire after 90 minutes (match the awake window)
-& "$HOME\.config\opencode\skills\awake\awake.ps1" light     # stop dark screensaver immediately (safety net - normal exits self-restore)
-& "$HOME\.config\opencode\skills\awake\renewtimer.ps1" -Minutes 90  # renewal timer: sleeps (window - 5 min) then exits - run AS A BACKGROUND JOB right after arming; its completion notifies the agent just before the window dies (see Renewal loop)
+& "<skill-dir>\awake.ps1" on        # nominal timed-window holder / redundancy
+& "<skill-dir>\awake.ps1" on 90     # timed: auto-release after 90 minutes
+& "<skill-dir>\awake.ps1" off       # normal power behavior (default)
+& "<skill-dir>\awake.ps1" status    # report current mode
+& "<skill-dir>\awake.ps1" dark      # dark screensaver: black now (verified OLED: black pixels = zero light; brightness/sensor never touched); F15 keepalive every 30 s while dark keeps the box out of Modern Standby; HUMAN input wakes, re-blanks after 180 s real idle (overrides: -IdleSeconds N, -HeartbeatSeconds N)
+& "<skill-dir>\awake.ps1" dark 90   # ...and auto-retire after 90 minutes (match the awake window)
+& "<skill-dir>\awake.ps1" light     # stop dark screensaver (= stop the keepalive) + kill any pending renewal timer; the normal stop
+& "<skill-dir>\renewtimer.ps1" -Minutes 90  # renewal timer: sleeps (window - 5 min) then exits - run AS A BACKGROUND JOB right after arming; its completion notifies the agent just before the window dies (see Renewal loop)
+# <skill-dir> = the directory of this skill file (e.g. C:\src\lmrun\skills\awake).
 # opt-in only, no UAC on the plain dark path: add -LockGuard to raise the elevated helper (see below)
 ```
 
@@ -44,7 +52,11 @@ point. When it fires, the agent decides:
 - **still processing the armed task** => re-run `awake.ps1 on <same N>` (this
   extends the timed window AND a live timed dark overlay in lockstep via the
   overlay state file's `until` mailbox - seamless, no restart, no flicker;
-  `on` never STARTS darkening), then start the next timer, and keep working;
+  `on` never STARTS darkening), then start the next timer, and keep working.
+  NEVER "fix" a renewal by re-running `dark` - if the overlay is already alive
+  `dark` is a no-op anyway, and if it died, re-arming it can black the screen
+  out from under a working operator (see Rules; report the death instead and
+  decide with the operator);
 - **task finished** => run the release sequence; the `off` step terminates any
   pending renewal timer mechanically, even if the agent forgot;
 - **`status` shows OFF** (the operator flipped the toggle) => do NOT renew, do
@@ -66,24 +78,45 @@ setting stuck at 0 (benign: locks keep the display on), restore it with the
 user's approval:
 `powercfg /setacvalueindex SCHEME_CURRENT SUB_VIDEO 8ec4b3a5-6868-48c2-be75-4f3044be88a7 60` + `setactive`.
 
-Since v5 (2026-11-16, operator decision) `dark` NEVER touches brightness or
-the ambient-light sensor - black pixels plus the overlay's execution-request
-hold are the whole mechanism. Nothing persists outside the overlay process,
-so a force-kill can strand nothing (the ES request dies with it) and there is
-no restore that can fail; `light` = stop + journal cleanup. Accepted trade:
-the LOCK SCREEN stays LIT when you lock and step away (the overlay cannot
-paint the secure desktop) - locked sessions keep full speed, they are just no
-longer dark. Lid close / power button still force sleep no matter what is
-armed - never close the lid during an armed run.
+Since v5 (2026-11-16, operator decision) `dark` NEVER touches brightness or the
+ambient-light sensor. v6 (2026-11-17) replaced the (ineffective) ES-hold
+protection story with the input keepalive: while DARK, the overlay injects a
+no-op F15 keypress every `$HeartbeatSeconds` (default 30) s - injected input
+resets Windows' display/sleep idle timers, so blanking and Modern Standby never
+engage; wake/re-blank use low-level hooks that see HUMAN input only (injected
+events are filtered, so the heartbeat never wakes the overlay). Nothing
+persists outside the overlay process - the heartbeat stops with it, a kill
+strands nothing; but that also means overlay dead = protection GONE and the box
+sleeps within ~5 min (a stale journal `journal=True alive=False` or
+`status: overlay exited` is now a reliable alarm). PANEL TRUTH, hardware-verified
+2026-11-17 (`WmiMonitorID` SDC41B0 = Samsung ATNA33AA08-0, the ASUS ProArt PX13
+panel): this is an **OLED** - black pixels emit NO light, so the dark overlay is
+a genuinely ZERO-LIGHT screen at any brightness setting (and costs the panel no
+wear). Brightness and the ambient sensor are therefore irrelevant to darkness
+and stay untouched; a same-day "v7" experiment writing the WMI backlight was
+reverted the same day (`WmiSetBrightness` syncs into the plan setting - a
+stranded-dim-panel risk class with no upside here). UNATTENDED ZERO-LIGHT
+POSTURE (operator decision 2026-11-17): step away WITHOUT locking - the lock
+screen renders content (clock/wallpaper = lit pixels) and nothing may darken
+the secure desktop. Lid close / power button / forced sleep still kill the
+process and force sleep no matter what is armed - never close the lid during an
+armed run. LOCKED-SESSION BEHAVIOR VALIDATED (2026-11-17): with the box locked
+and unattended, the keepalive stream continued and produced ZERO Kernel-Power
+506/566 events past the 300 s blank-timeout boundary - injected input DOES hold
+a locked session out of Modern Standby; the overlay witnessed SessionLock and
+stayed dark+healthy throughout.
 
-`dark` is the operator's dark-room mode: pixels off (OLED), display logically
-ON, so neither Windows nor the AMD driver ever engages its screen-off power
-policy. The detached overlay holds display+system execution requests for its
-whole life and releases hold + cursor whenever it exits (idle cycle,
-duration expiry, or kill via `light`). It is part of the standard arm at task
+`dark` is the operator's dark-room mode: pixels OFF (verified OLED = zero
+light), display logically ON (the keepalive prevents the OS ever blanking it), so neither Windows nor the
+AMD driver ever engages its screen-off power policy - and the S0ix standby that
+kills background processes never engages either. The detached overlay releases
+cursor + holds whenever it exits (idle cycle never ends the process; duration
+expiry or kill via `light` do). It is part of the standard arm at task
 start (see Rules). Invoking it MID-task on the operator's behalf without being
 asked remains forbidden - the screen must never go dark while they are actively
-working in front of it.
+working in front of it (2026-11-17: an arm/re-arm while the operator was at the
+keyboard got the overlay force-killed within minutes - Task-Manager style,
+journal intact).
 
 Prefer a timed mode (`on <minutes>`) when the user names a job with a rough
 duration, so the machine reverts to normal sleep on its own - and pair every
@@ -126,8 +159,12 @@ timer is an incomplete arm.
   running, the script warns; the change applies when PowerToys starts.
 - Verify only with `status`. Elevated `powercfg /requests` is the ground truth
   but triggers UAC - only run it if the user explicitly wants proof.
-- If a job is still suspending with Awake ON, do not escalate settings; check
-  for Kernel-Power event id 506 after the screen blanked and report findings.
+- If a job is still suspending while armed, do not escalate settings; check
+  for Kernel-Power event id 506 after the screen blanked AND cross-check
+  `darkscreen.log`: the v6 overlay logs `KEEPALIVE #n` every nudge - a gap
+  between the last KEEPALIVE and the 506 means the overlay (not the mechanism)
+  died at that moment; find out what killed it. A 506 while KEEPALIVE lines
+  keep streaming would mean the keepalive itself stopped working - report it.
 - Known root cause on this machine (found 2026-11-09): OEM plans (e.g.
   `PD_Standard`) can carry a hidden per-plan override disabling the **Away Mode
   Policy** (sleep subgroup `238c9fa8-0aad-41ed-83f4-97be242c8f20`, setting
@@ -153,15 +190,23 @@ timer is an incomplete arm.
   events that coincide with the job's time gaps.
 - Remind the user, when arming indefinitely on a laptop: switch Awake OFF before
   unplugging or packing the machine.
-- **Locking remains the recommended posture when the operator steps away** -
-  secure AND full speed: measured on the real ASR workload, locked+black
-  10.3-10.6 s vs unlocked 10.2-10.7 s per identical 90 s clip, zero standby
-  events. Since v5 the lock screen itself stays LIT (brightness writes were
-  removed; the overlay cannot paint the secure desktop) - the operator
-  accepted this trade: locked runs are secure and fast, just not dark.
+- **The unattended dark-room posture is DON'T LOCK** (operator decision
+  2026-11-17): walk away with the session unlocked and the overlay engaged -
+  on this verified-OLED panel that is genuinely zero light, and protection is
+  identical unlocked vs locked. Locking stays a free choice for physical
+  security, with exactly one cost: the lock screen renders content (lit
+  pixels); nothing here may darken the secure desktop (brightness writes are
+  permanently out - they sync into the plan and strand dimness). True
+  "display off + full speed" is IMPOSSIBLE on this S0ix box: display-off is
+  precisely what triggers the AMD power-throttle policy and the
+  idle->blank->S0ix 506 kill chain, and injected keepalive input always
+  re-powers the display - do not attempt it. Protection under a lock IS
+  validated (2026-11-17: zero 506/566 past the blank boundary while locked,
+  overlay alive; ASR speed parity locked vs unlocked), so a lock encountered
+  mid-run costs darkness, never safety.
   Do not warn about locks and
   do not try to prevent them; just size the timed `dark` window so the hold
   outlives the job. On unattended finishes prefer letting the timed window
   expire over an explicit
-  `off`+`light` while nobody is at the machine - release drops the hold and the
-  box suspends within ~1 min, killing anything still running (2026-11-10, twice).
+  `off`+`light` while nobody is at the machine - release drops the keepalive and
+  the box suspends within ~5 min, killing anything still running (2026-11-10, twice).
