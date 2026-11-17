@@ -14,6 +14,10 @@
 //   ES_DISPLAY_REQUIRED is rejected (err 87). THE protection is injecting a no-op F15
 //   keypress: injected input resets the OS idle timers so blank/standby never engage.
 //   LL hooks filter LLMHF_INJECTED so the heartbeat never counts as human presence.
+// - v6.2: the worker is spawned via WMI (Win32_Process.Create -> parent WmiPrvSE) so it lives
+//   OUTSIDE the caller's console/job/process tree: the silent deaths previously blamed only on
+//   standby were mostly agent-harness tree-reaping taking workers whose 'start' shell ended
+//   (forensics 2026-11-18 - see SpawnDetached).
 // - v6.1 change vs the ps1: the heartbeat runs for the WHOLE process lifetime, not only
 //   while dark - closes the Active-phase race (DC blank is 180 s; the first dark-phase
 //   nudge could lose to it).
@@ -275,13 +279,11 @@ single-file skipped per operator: extraction/startup overhead.) During developme
         }
         else exe = Environment.ProcessPath ?? "awake.exe";
 
-        var psi = new ProcessStartInfo { UseShellExecute = true, WindowStyle = ProcessWindowStyle.Hidden };
-        psi.FileName = exe;
-        foreach (var a in new[] { "run", "--minutes", o.Minutes.ToString(), "--idle", o.Idle.ToString(),
-                                  "--heartbeat", o.Heartbeat.ToString(), "--state-dir", o.StateDir })
-            psi.ArgumentList.Add(a);
-        if (o.Dark) psi.ArgumentList.Add("--dark");
-        Process.Start(psi);
+        var workerArgs = new[] { "run", "--minutes", o.Minutes.ToString(), "--idle", o.Idle.ToString(),
+                                 "--heartbeat", o.Heartbeat.ToString(), "--state-dir", o.StateDir };
+        if (o.Dark) workerArgs = workerArgs.Append("--dark").ToArray();
+        string spawnedVia = SpawnDetached(exe, workerArgs);
+        Keeper.Log(o, $"[cli] worker spawned via {spawnedVia}");
 
         for (int i = 0; i < 60; i++)
         {
@@ -290,7 +292,7 @@ single-file skipped per operator: extraction/startup overhead.) During developme
             if (c != null && Keeper.AlivePid(c) != null)
             {
                 string mode = c.Mode == "dark" ? "dark overlay + keeper" : "lit keeper (no window)";
-                Console.WriteLine($"STARTED (pid {c.Pid}, {mode}): F15 heartbeat every {c.HeartbeatSeconds} s " +
+                Console.WriteLine($"STARTED (pid {c.Pid}, {mode}, spawned via {spawnedVia}): F15 heartbeat every {c.HeartbeatSeconds} s " +
                                   $"for the WHOLE run holds off Modern Standby; retires {c.Until}.");
                 if (c.Mode == "dark")
                     Console.WriteLine($"Overlay: pixel black NOW (OLED: zero light; brightness/sensor untouched), " +
@@ -304,6 +306,36 @@ single-file skipped per operator: extraction/startup overhead.) During developme
         }
         Console.Error.WriteLine("worker did not claim the control file within 15 s - check awake.log");
         return 1;
+    }
+
+    // Spawn the worker OUTSIDE the caller's process tree. 2026-11-18 forensics: workers started
+    // from agent harness shells died silently mid-heartbeat when the harness reaped that shell's
+    // process tree (taskkill /F /T or kill-on-close job) - OS running, zero log events, stale
+    // control file left behind (6 deaths overnight 2026-11-17/18, all in agent-session windows).
+    // A plain child - even Hidden + ShellExecute - shares the caller's console/job AND its parent
+    // link, so it dies with the tree. WMI Win32_Process.Create spawns under WmiPrvSE: different
+    // parent, different job, no console. Falls back to the old in-tree ShellExecute spawn if
+    // WbemScripting/WMI is unavailable (logged, so the journal always shows which path was used).
+    static string SpawnDetached(string exe, string[] args)
+    {
+        try
+        {
+            var t = Type.GetTypeFromProgID("WbemScripting.SWbemLocator");
+            if (t != null)
+            {
+                dynamic locator = Activator.CreateInstance(t)!;
+                dynamic svc = locator.ConnectServer(".", "root\\cimv2");
+                dynamic wmiProc = svc.Get("Win32_Process");
+                string cmd = "\"" + exe + "\" " + string.Join(" ", args.Select(a => a.Contains(' ') ? "\"" + a + "\"" : a));
+                object? r = wmiProc.Create(cmd, Path.GetDirectoryName(exe), null, null); // dispatch returns ReturnValue
+                if (r == null || Convert.ToInt32(r, CultureInfo.InvariantCulture) == 0) return "wmi (out-of-tree)";
+            }
+        }
+        catch { }
+        var psi = new ProcessStartInfo { UseShellExecute = true, WindowStyle = ProcessWindowStyle.Hidden, FileName = exe };
+        foreach (var a in args) psi.ArgumentList.Add(a);
+        Process.Start(psi);
+        return "shell (in-tree FALLBACK - WMI unavailable)";
     }
 
     public static int Stop(Opts o)

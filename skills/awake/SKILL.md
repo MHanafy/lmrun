@@ -59,8 +59,17 @@ control file or EXTENDS a live worker (single instance via named mutex; an exten
 never re-blanks the screen); `stop` just writes `intent:"stop"` and the worker
 exits cleanly within ~1 s (cursor shown, ES cleared, `EXIT` logged, file deleted);
 control file present + pid dead = **"protection is GONE" alarm** (the next
-`start` clears it - 2026-11-17 showed an external, unlogged killer CAN take the
-process, so check `status` at task checkpoints on long runs).
+`start` clears it - check `status` at task checkpoints on long runs).
+**Silent-killer ROOT CAUSE identified 2026-11-18** (six overnight deaths: heartbeat
+cut mid-`KEEPALIVE`, no `EXIT`, zero WER/event-log traces, OS running the whole
+time, no Kernel-Power 506 anywhere near the deaths): NOT standby - the agent
+harness reaps its shell's **process tree** when the session that ran `start`
+ends, and the old in-tree `Process.Start` worker was a child of that shell.
+Fix (v6.2): the worker is spawned **out-of-tree via WMI `Win32_Process.Create`**
+(parent = `WmiPrvSE.exe`, no shared console/job; verify with
+`Get-CimInstance Win32_Process -Filter "ProcessId=<pid>"`), with the old
+ShellExecute spawn kept only as fallback; `awake.log` records
+`[cli] worker spawned via wmi (out-of-tree)` (or `shell ... FALLBACK`) per arm.
 
 **Legacy fallback (PowerToys-based, superseded 2026-11-17, kept until deleted):**
 
