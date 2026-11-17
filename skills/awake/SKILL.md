@@ -43,7 +43,9 @@ $dk = "<skill-dir>\app\bin\awake.exe"   # e.g. C:\src\lmrun\skills\awake\app\bin
 & $dk start --minutes 90          # RENEWAL while live = EXTEND (NEVER pass --dark as a renewal)
 & $dk stop                        # cooperative stop via mailbox (force after 5 s); also kills the renewal timer
 & $dk renew-wait --minutes 90     # renewal alarm: sleeps (window-5 min) then exits - run AS an agent background job
-# options: --idle <s> (human idle before re-dark, default 180), --heartbeat <s> (F15 cadence, default 30), --state-dir <path> (alternate instance, for testing)
+# options: --idle <s> (human idle before re-dark, default 180), --heartbeat <s> (F15 cadence, default 30), --state-dir <path> (alternate instance, for testing),
+#          --no-tray (suppress the worker's tray icon: live status tooltip + "Stop awake" menu + Open log; in the dark phase the
+#          overlay covers the taskbar, so the tray is reachable only after human input wakes - CLI stop always works)
 # rebuild after source changes:
 #   dotnet publish "<skill-dir>\app\awake.cs" -c Release -o "<skill-dir>\app\bin"
 # (Native AOT deliberately NOT used: WinForms is unsupported by AOT/trimming; self-contained

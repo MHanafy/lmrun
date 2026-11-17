@@ -81,7 +81,7 @@ sealed class Opts
 {
     public string Verb = "";
     public int Minutes, Idle = 180, Heartbeat = 30;
-    public bool Dark, Json;
+    public bool Dark, Json, NoTray;
     public string StateDir = DefaultDir();
 
     public static string DefaultDir() =>
@@ -100,6 +100,7 @@ sealed class Opts
                 case "--heartbeat": o.Heartbeat = int.Parse(args[++i]); break;
                 case "--dark": o.Dark = true; break;
                 case "--json": o.Json = true; break;
+                case "--no-tray": o.NoTray = true; break;
                 case "--state-dir": o.StateDir = Path.GetFullPath(args[++i]); break;
                 default: throw new ArgumentException($"unknown option '{args[i]}'");
             }
@@ -216,6 +217,9 @@ awake - keep-awake + zero-light dark overlay (files: %LOCALAPPDATA%\Awake\)
         Re-running start while live = EXTEND the window (never re-blanks; pass --dark
         only if you also want to turn the overlay ON on a live keeper).
   stop  cooperative stop: flips the mailbox; the worker exits itself (force-kill after 5 s).
+        The worker also shows a tray icon (status tooltip + Stop + Open log) while running;
+        --no-tray hides it. In dark phase the overlay covers the taskbar - any human input
+        wakes it first, THEN the tray is reachable.
   status [--json]
   renew-wait --minutes N   sleep (N-5) min then exit - run as agent background job; its
         completion is the agent's renewal alarm. Renew with 'start --minutes N' (NO --dark).
@@ -282,6 +286,7 @@ single-file skipped per operator: extraction/startup overhead.) During developme
         var workerArgs = new[] { "run", "--minutes", o.Minutes.ToString(), "--idle", o.Idle.ToString(),
                                  "--heartbeat", o.Heartbeat.ToString(), "--state-dir", o.StateDir };
         if (o.Dark) workerArgs = workerArgs.Append("--dark").ToArray();
+        if (o.NoTray) workerArgs = workerArgs.Append("--no-tray").ToArray();
         string spawnedVia = SpawnDetached(exe, workerArgs);
         Keeper.Log(o, $"[cli] worker spawned via {spawnedVia}");
 
@@ -561,6 +566,7 @@ internal static class Worker
         bool hookOk = false, isDark = false, shutting = false;
         int tick = 0, nudges = 0;
         long lastSeq = -1;
+        TrayUi? tray = null;
 
         void EnterDark()
         {
@@ -578,11 +584,16 @@ internal static class Worker
             Keeper.Log(o, "WAKE (human input)");
         }
         string HumanIdleLabel() => hookOk ? $"{(int)Native.Human.IdleSeconds}s" : "hooks-dead";
+        string RetireLabel()
+        {
+            try { return DateTimeOffset.Parse(st.Until!, CultureInfo.InvariantCulture).ToString("HH:mm"); } catch { return "?"; }
+        }
         void Cleanup(string why)
         {
             if (shutting) return;
             shutting = true;
             t.Stop();
+            try { tray?.Dispose(); } catch { } tray = null;
             Cursor.Show();
             Native.Es.Clear();
             try { var c = Keeper.Load(o); if (c == null || c.Pid == Environment.ProcessId) File.Delete(Keeper.StatePath(o)); } catch { }
@@ -666,6 +677,7 @@ internal static class Worker
                 st.Nudges = nudges;
                 st.UpdatedAt = DateTimeOffset.Now.ToString("o", CultureInfo.InvariantCulture);
                 try { Keeper.Save(o, st); } catch { }
+                tray?.Update(isDark);
             }
         };
 
@@ -679,8 +691,100 @@ internal static class Worker
         if (st.Mode == "dark") EnterDark();
         t.Start();
 
+        if (!o.NoTray)
+            try
+            {
+                tray = new TrayUi(Keeper.LogPath(o),
+                    () => $"awake - {(st.Mode == "dark" ? "dark+keeper" : "keeper")} - {(isDark ? "DARK" : "lit")} - nudge #{nudges} - retires {RetireLabel()}",
+                    () => Cleanup("stop requested from tray"));
+                tray.Balloon($"Armed ({st.Mode}): F15 keep-awake live, retires {RetireLabel()}. Stop from this menu.");
+            }
+            catch (Exception tx) { Keeper.Log(o, $"tray unavailable: {tx.Message}"); tray = null; }
+
         Application.Run(ctx);
         Cleanup("message loop ended");
         return 0;
+    }
+}
+
+// Tray icon for the live worker: at-a-glance status (tooltip + menu header) and a
+// one-click cooperative stop, so the console can stay hidden. Pure notification - it
+// touches NONE of the protection path (heartbeat/hooks/mailbox unchanged); Stop reuses
+// the exact cooperative Cleanup() the CLI mailbox uses. CAVEAT (by design): during the
+// dark phase the overlay covers the taskbar (zero-light doctrine), so the tray is only
+// clickable after human input wakes the overlay - the CLI 'stop' always works. A hard-
+// killed worker's icon ghosts in the tray until hovered - standard Windows behavior.
+sealed class TrayUi : IDisposable
+{
+    readonly NotifyIcon icon;
+    readonly ToolStripMenuItem header;
+    readonly ContextMenuStrip menu;
+    readonly Icon iconDark, iconLit;
+    readonly Func<string> statusText;
+
+    public TrayUi(string logPath, Func<string> statusText, Action stop)
+    {
+        this.statusText = statusText;
+        iconDark = MakeIcon(filled: true);   // dark phase: filled disc
+        iconLit = MakeIcon(filled: false);   // lit/keeper: open ring
+        header = new ToolStripMenuItem(statusText()) { Enabled = false };
+        var openLog = new ToolStripMenuItem("Open log", null, (s, e) =>
+        {
+            try { Process.Start(new ProcessStartInfo(logPath) { UseShellExecute = true }); } catch { }
+        });
+        var stopItem = new ToolStripMenuItem("Stop awake", null, (s, e) => stop());
+        menu = new ContextMenuStrip();
+        menu.Items.AddRange(new ToolStripItem[] { header, new ToolStripSeparator(), openLog, new ToolStripSeparator(), stopItem });
+        icon = new NotifyIcon { Icon = iconLit, Text = "awake", ContextMenuStrip = menu, Visible = true };
+        icon.DoubleClick += (s, e) => Balloon(statusText());
+    }
+
+    public void Update(bool isDark)
+    {
+        try
+        {
+            string s = statusText();
+            icon.Text = s.Length > 127 ? s[..127] : s;  // NotifyIcon hard limit
+            header.Text = s;
+            icon.Icon = isDark ? iconDark : iconLit;
+        }
+        catch { }
+    }
+
+    public void Balloon(string text)
+    {
+        try { icon.ShowBalloonTip(4000, "awake", text, ToolTipIcon.Info); } catch { }
+    }
+
+    // drawn at runtime (no .ico asset; single-file doctrine). white glyph + soft dark
+    // rim so it reads on both dark and light taskbars.
+    static Icon MakeIcon(bool filled)
+    {
+        using var bmp = new Bitmap(16, 16);
+        using (var g = Graphics.FromImage(bmp))
+        {
+            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            g.Clear(Color.Transparent);
+            if (filled)
+            {
+                using var sh = new SolidBrush(Color.FromArgb(120, 0, 0, 0));
+                g.FillEllipse(sh, 3, 3, 12, 12);
+                g.FillEllipse(Brushes.White, 2, 2, 11, 11);
+            }
+            else
+            {
+                using var dark = new Pen(Color.FromArgb(120, 0, 0, 0), 4f);
+                using var white = new Pen(Color.White, 2f);
+                g.DrawEllipse(dark, 3.5f, 3.5f, 9, 9);
+                g.DrawEllipse(white, 3.5f, 3.5f, 9, 9);
+            }
+        }
+        return Icon.FromHandle(bmp.GetHicon());
+    }
+
+    public void Dispose()
+    {
+        try { icon.Visible = false; } catch { }
+        icon.Dispose(); menu.Dispose(); iconDark.Dispose(); iconLit.Dispose();
     }
 }
