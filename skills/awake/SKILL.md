@@ -1,6 +1,6 @@
 ---
 name: Awake
-description: Toggle this PC's keep-awake state (PowerToys Awake) so long AI jobs survive the screen turning off, and its dark-screensaver mode (pure black pixel overlay) for dark-room runs without the driver's screen-off throttling. Use when the user says "keep the PC awake/running" or "dark mode", is about to start or is running a long transcription/model job, asks to undo keep-awake or stop the dark screen, or asks whether the machine will sleep.
+description: Toggle this PC's keep-awake protection (awake app: no-op F15 key-injection keepalive + pure-black zero-light pixel overlay) so long AI jobs survive the screen turning off, and its dark mode for dark-room runs without the driver's screen-off throttling. Use when the user says "keep the PC awake/running" or "dark mode", is about to start or is running a long transcription/model job, asks to undo keep-awake or stop the dark screen, or asks whether the machine will sleep.
 ---
 
 # Awake (screen-off keep-running toggle + dark screensaver)
@@ -13,63 +13,91 @@ its execution-request hold was armed. The v5 idea that the ES hold was "the
 authoritative proof of protection" is FALSE on this build: ES_SYSTEM/AWAYMODE
 do not stop Modern-Standby entry, and the only flag that would
 (ES_DISPLAY_REQUIRED) is rejected here (err 87 - display power is OS-owned).
-The real mechanism since v6: the `dark` overlay injects a no-op F15 keypress
-every 30 s while darkened. Injected input resets the system idle timers, so
+The real mechanism since v6: the worker injects a no-op F15 keypress every
+HeartbeatSeconds. Injected input resets the system idle timers, so
 the display never blanks and Modern Standby never engages - `status` showing
-the screensaver RUNNING (and a growing KEEPALIVE count in darkscreen.log) is
+RUNNING (and a growing KEEPALIVE count in awake.log) is
 the proof of protection, verified by the ABSENCE of Kernel-Power 506 events.
-The PowerToys Awake toggle remains as a nominal window holder / harmless
-redundancy (if the machine may already be dozing, run a short command to wake
-it before arming). The AMD driver also runs a lower power policy whenever the display
-is logically off, so `dark` keeps the display ON (via the keepalive) and makes
+Since v6.1 / awake (2026-11-17) the heartbeat runs for the WHOLE process
+lifetime, not only while dark - closing the Active-phase race where the DC
+blank timeout (180 s) could beat the first dark-phase nudge. The PowerToys
+Awake dependency is RETIRED (its ES hold was measured inert against idle
+standby here; the "keeper" mode of awake IS the keep-awake) - the legacy
+PowerToys-based ps1 scripts remain in the folder as fallback until deleted.
+The AMD driver also runs a lower power policy whenever the display
+is logically off, so dark mode keeps the display ON (via the keepalive) and makes
 it black with an OLED overlay instead.
 
 ## Tool
 
-Run the bundled script (same directory as this skill file):
+**Current implementation: `app\awake.cs`** - a single-file C# app published FRAMEWORK-DEPENDENT
+into **`<skill-dir>\app\bin\awake.exe`** (~200 KB; needs the .NET 10 Windows Desktop
+runtime, already installed here; the repo tracks only the source - `app\bin\` is gitignored.
+Self-contained publish deliberately skipped: extraction/startup overhead):
 
 ```powershell
-& "<skill-dir>\awake.ps1" on        # nominal timed-window holder / redundancy
-& "<skill-dir>\awake.ps1" on 90     # timed: auto-release after 90 minutes
-& "<skill-dir>\awake.ps1" off       # normal power behavior (default)
-& "<skill-dir>\awake.ps1" status    # report current mode
-& "<skill-dir>\awake.ps1" dark      # dark screensaver: black now (verified OLED: black pixels = zero light; brightness/sensor never touched); F15 keepalive every 30 s while dark keeps the box out of Modern Standby; HUMAN input wakes, re-blanks after 180 s real idle (overrides: -IdleSeconds N, -HeartbeatSeconds N)
-& "<skill-dir>\awake.ps1" dark 90   # ...and auto-retire after 90 minutes (match the awake window)
-& "<skill-dir>\awake.ps1" light     # stop dark screensaver (= stop the keepalive) + kill any pending renewal timer; the normal stop
-& "<skill-dir>\renewtimer.ps1" -Minutes 90  # renewal timer: sleeps (window - 5 min) then exits - run AS A BACKGROUND JOB right after arming; its completion notifies the agent just before the window dies (see Renewal loop)
+$dk = "<skill-dir>\app\bin\awake.exe"   # e.g. C:\src\lmrun\skills\awake\app\bin\awake.exe
+& $dk start --minutes 90 --dark   # standard arm: keep-awake + dark overlay NOW (black after 180 s real idle)
+& $dk start --minutes 90          # keep-awake only (lit keeper, no window)
+& $dk status [--json]             # truth = control file + pid liveness
+& $dk start --minutes 90          # RENEWAL while live = EXTEND (NEVER pass --dark as a renewal)
+& $dk stop                        # cooperative stop via mailbox (force after 5 s); also kills the renewal timer
+& $dk renew-wait --minutes 90     # renewal alarm: sleeps (window-5 min) then exits - run AS an agent background job
+# options: --idle <s> (human idle before re-dark, default 180), --heartbeat <s> (F15 cadence, default 30), --state-dir <path> (alternate instance, for testing)
+# rebuild after source changes:
+#   dotnet publish "<skill-dir>\app\awake.cs" -c Release -o "<skill-dir>\app\bin"
+# (Native AOT deliberately NOT used: WinForms is unsupported by AOT/trimming; self-contained
+#  single-file also NOT used: operator skipped it for extraction/startup overhead - this box
+#  has the desktop runtime, framework-dependent is instant: ~250 ms cold / ~120 ms warm.)
+# Development without publishing also works from "<skill-dir>\app": `dotnet run awake.cs -- <verb>`
+# (it spawns the worker from an installed runtime copy to avoid locking the temp build).
+```
+
+Mailbox semantics (files in `%LOCALAPPDATA%\Awake\`: `keeper.json` control
+file, `awake.log` journal, `renewtimer.json` timer box): `start` creates the
+control file or EXTENDS a live worker (single instance via named mutex; an extend
+never re-blanks the screen); `stop` just writes `intent:"stop"` and the worker
+exits cleanly within ~1 s (cursor shown, ES cleared, `EXIT` logged, file deleted);
+control file present + pid dead = **"protection is GONE" alarm** (the next
+`start` clears it - 2026-11-17 showed an external, unlogged killer CAN take the
+process, so check `status` at task checkpoints on long runs).
+
+**Legacy fallback (PowerToys-based, superseded 2026-11-17, kept until deleted):**
+
+```powershell
+& "<skill-dir>\awake.ps1" on 90 / off / status / dark 90 / light
+& "<skill-dir>\renewtimer.ps1" -Minutes 90
 # <skill-dir> = the directory of this skill file (e.g. C:\src\lmrun\skills\awake).
-# opt-in only, no UAC on the plain dark path: add -LockGuard to raise the elevated helper (see below)
 ```
 
 **Renewal loop - the AGENT controls renewals** (added 2026-11-15). A timed
 window is an estimate and long jobs outrun it (the classic failure: a 3 h
-transcription suspended at minute 90). So the standard timed arm is THREE
-actions: `on <N>`, `dark <N>`, and starting `renewtimer.ps1 -Minutes <N>` as a
-background job via the agent's own background mechanism (NOT Start-Process -
+transcription suspended at minute 90). So the standard timed arm is TWO
+actions: `start --minutes <N> --dark` and starting `renew-wait --minutes <N>`
+as a background job via the agent's own background mechanism (NOT Start-Process -
 a detached process cannot notify the agent). The timer itself is dumb: it
 sleeps N-5 minutes and exits; the completion notification is the retrigger
 point. When it fires, the agent decides:
-- **still processing the armed task** => re-run `awake.ps1 on <same N>` (this
-  extends the timed window AND a live timed dark overlay in lockstep via the
-  overlay state file's `until` mailbox - seamless, no restart, no flicker;
-  `on` never STARTS darkening), then start the next timer, and keep working.
-  NEVER "fix" a renewal by re-running `dark` - if the overlay is already alive
-  `dark` is a no-op anyway, and if it died, re-arming it can black the screen
-  out from under a working operator (see Rules; report the death instead and
-  decide with the operator);
-- **task finished** => run the release sequence; the `off` step terminates any
-  pending renewal timer mechanically, even if the agent forgot;
-- **`status` shows OFF** (the operator flipped the toggle) => do NOT renew, do
-  NOT respawn the timer - report it and let the loop end.
+- **still processing the armed task** => re-run `start --minutes <same N>`
+  WITHOUT `--dark` (against a live worker this is an EXTEND: it pushes the
+  `until` mailbox - seamless, no restart, no flicker, and it can never
+  black the screen on a working operator), start the next timer, keep working.
+  NEVER pass `--dark` in a renewal - against a dead worker `start --dark`
+  RE-ARMS darkening and can black the screen out from under the operator
+  (report the death instead and decide with them);
+- **task finished** => run `stop` (terminates the worker and any pending
+  renewal timer mechanically, even if the agent forgot);
+- **`status` shows OFF** (the operator stopped it) => do NOT renew, do NOT
+  respawn the timer - report it and let the loop end.
 Only the agent renews, so a dead or idle agent degrades to the plain timed
-backstop: the un-renewed window simply expires and the box sleeps. `status`
-reports the pending timer; `off` always kills it - a release must never leave
-a renewal timer behind.
+backstop: the un-renewed window simply expires and the box sleeps. `stop`
+always kills the timer box - a release must never leave a renewal timer behind.
 
-The **lock guard is opt-in** (`-LockGuard`) since 2026-11-10: no UAC prompt on
-the normal path. It was demoted because measurement showed it unnecessary -
-a locked session keeps full speed while the overlay holds its execution
-request. With `-LockGuard` an elevated helper (ONE UAC prompt, raised FIRST
+The **lock guard is legacy ps1-only** (`-LockGuard` opt-in since 2026-11-10;
+awake does not implement it - it was demoted precisely because measurement
+showed it unnecessary, see below). No UAC prompt on the normal path either way.
+Measurement: a locked session keeps full speed while the keepalive runs.
+With `-LockGuard` an elevated helper (ONE UAC prompt, raised FIRST
 while the screen is still lit; screensaver engages only after it is answered)
 forces the display ON if locked; restore it only if lock-throttling behavior
 ever comes back. When armed it self-restores at window expiry or within ~15 s
@@ -78,17 +106,20 @@ setting stuck at 0 (benign: locks keep the display on), restore it with the
 user's approval:
 `powercfg /setacvalueindex SCHEME_CURRENT SUB_VIDEO 8ec4b3a5-6868-48c2-be75-4f3044be88a7 60` + `setactive`.
 
-Since v5 (2026-11-16, operator decision) `dark` NEVER touches brightness or the
+Since v5 (2026-11-16, operator decision) dark mode NEVER touches brightness or the
 ambient-light sensor. v6 (2026-11-17) replaced the (ineffective) ES-hold
-protection story with the input keepalive: while DARK, the overlay injects a
-no-op F15 keypress every `$HeartbeatSeconds` (default 30) s - injected input
+protection story with the input keepalive: the worker injects a
+no-op F15 keypress every `--heartbeat` (default 30) s - injected input
 resets Windows' display/sleep idle timers, so blanking and Modern Standby never
 engage; wake/re-blank use low-level hooks that see HUMAN input only (injected
-events are filtered, so the heartbeat never wakes the overlay). Nothing
-persists outside the overlay process - the heartbeat stops with it, a kill
-strands nothing; but that also means overlay dead = protection GONE and the box
-sleeps within ~5 min (a stale journal `journal=True alive=False` or
-`status: overlay exited` is now a reliable alarm). PANEL TRUTH, hardware-verified
+events are filtered, so the heartbeat never wakes the overlay). Since v6.1
+(awake, 2026-11-17) the heartbeat runs for the WHOLE process lifetime.
+Nothing
+persists outside the worker process - the heartbeat stops with it, a kill
+strands nothing (the control file is the only trace, and `start` clears it);
+but that also means worker dead = protection GONE and the box
+sleeps within ~5 min (`status` reporting DEAD with a control file present is
+the reliable alarm). PANEL TRUTH, hardware-verified
 2026-11-17 (`WmiMonitorID` SDC41B0 = Samsung ATNA33AA08-0, the ASUS ProArt PX13
 panel): this is an **OLED** - black pixels emit NO light, so the dark overlay is
 a genuinely ZERO-LIGHT screen at any brightness setting (and costs the panel no
@@ -106,12 +137,12 @@ and unattended, the keepalive stream continued and produced ZERO Kernel-Power
 a locked session out of Modern Standby; the overlay witnessed SessionLock and
 stayed dark+healthy throughout.
 
-`dark` is the operator's dark-room mode: pixels OFF (verified OLED = zero
+Dark mode (`start --dark`) is the operator's dark-room mode: pixels OFF (verified OLED = zero
 light), display logically ON (the keepalive prevents the OS ever blanking it), so neither Windows nor the
 AMD driver ever engages its screen-off power policy - and the S0ix standby that
-kills background processes never engages either. The detached overlay releases
-cursor + holds whenever it exits (idle cycle never ends the process; duration
-expiry or kill via `light` do). It is part of the standard arm at task
+kills background processes never engages either. The detached worker releases
+cursor + holds whenever it exits (the idle cycle never ends the process; duration
+expiry or `stop` do). It is part of the standard arm at task
 start (see Rules). Invoking it MID-task on the operator's behalf without being
 asked remains forbidden - the screen must never go dark while they are actively
 working in front of it (2026-11-17: an arm/re-arm while the operator was at the
@@ -126,20 +157,18 @@ timer is an incomplete arm.
 ## Rules
 
 - **Arm/stop protocol**: at the START of a task that needs it, arm the standard
-  setup - `on <minutes>` AND `dark <same minutes>` AND the renewal timer as a
-  background job, always timed (see Renewal loop above; the timer is what keeps
+  setup - `start --minutes <N> --dark` AND the `renew-wait --minutes <N>` job as a
+  background job (see Renewal loop above; the timer is what keeps
   an undersized window from suspending a long job). Dark is armed by default
-  (operator's standard config: the screensaver
+  (operator's standard config: the overlay
   only blanks after 3 min of no input, so watching progress is unaffected);
-  omit `dark` only if the user opts out for that task. Expect no UAC prompt
-  on this default path (the lock guard is opt-in). Honor every timer
-  notification while armed: still working => renew (`on <same minutes>`) and
-  respawn the timer; finished => release; status says OFF => stand down and
-  report, never renew. Stop as the
-  FINAL action before ending the turn: `off` (terminates any pending renewal
-  timer), plus `light` if `status` shows a
-  screensaver OR lock guard still running (light also stands the guard down -
-  it self-restores within ~15 s). Timed expiry is the backstop, the explicit
+  dark mode is skipped only if the user opts out for that task. Expect no UAC prompt
+  on this default path. Honor every timer
+  notification while armed: still working => renew (`start --minutes <same N>`,
+  NO `--dark`) and respawn the timer; finished => `stop`; status says OFF =>
+  stand down and report, never renew. Stop as the
+  FINAL action before ending the turn - the cooperative `stop` terminates the
+  worker and any pending renewal timer. Timed expiry is the backstop, the explicit
   stop is the courtesy - never leave either armed indefinitely behind you.
   The build/validate/test step IS part of the task: release only after it
   finishes, never when the deliverable files are written (2026-11-10: a
@@ -154,15 +183,17 @@ timer is an incomplete arm.
   ULPS, or ASUS/Fn+Q modes yourself (the built-in lock guard, the documented
   repairs below, and their documented manual restores are the only exceptions,
   and only with the user's approval) - the toggle is all it does.
-- The script writes `%LOCALAPPDATA%\Microsoft\PowerToys\Awake\settings.json`;
-  the running Awake module applies it within ~2 seconds. If PowerToys is not
-  running, the script warns; the change applies when PowerToys starts.
+- awake writes ONLY under `%LOCALAPPDATA%\Awake\` (control file, journal,
+  timer box, `runtime\` copy) - PowerToys is not involved. The legacy ps1 scripts
+  use `%LOCALAPPDATA%\Microsoft\PowerToys\Awake\` instead (`settings.json` for the
+  Awake module, `darkstate.json` + `darkscreen.log` for the old overlay).
 - Verify only with `status`. Elevated `powercfg /requests` is the ground truth
   but triggers UAC - only run it if the user explicitly wants proof.
 - If a job is still suspending while armed, do not escalate settings; check
   for Kernel-Power event id 506 after the screen blanked AND cross-check
-  `darkscreen.log`: the v6 overlay logs `KEEPALIVE #n` every nudge - a gap
-  between the last KEEPALIVE and the 506 means the overlay (not the mechanism)
+  the journal (`%LOCALAPPDATA%\Awake\awake.log`; `darkscreen.log` for
+  legacy ps1 runs): the worker logs `KEEPALIVE #n` every nudge - a gap
+  between the last KEEPALIVE and the 506 means the process (not the mechanism)
   died at that moment; find out what killed it. A 506 while KEEPALIVE lines
   keep streaming would mean the keepalive itself stopped working - report it.
 - Known root cause on this machine (found 2026-11-09): OEM plans (e.g.
@@ -188,8 +219,8 @@ timer is an incomplete arm.
   expecting `ACSettingIndex 0x0`. A 506+566 pair in the same second with no
   heartbeat gap is a harmless aborted attempt; look for Kernel-Power 506
   events that coincide with the job's time gaps.
-- Remind the user, when arming indefinitely on a laptop: switch Awake OFF before
-  unplugging or packing the machine.
+- Remind the user, when arming indefinitely on a laptop: run `stop` (or flip the
+  legacy toggle OFF) before unplugging or packing the machine.
 - **The unattended dark-room posture is DON'T LOCK** (operator decision
   2026-11-17): walk away with the session unlocked and the overlay engaged -
   on this verified-OLED panel that is genuinely zero light, and protection is
@@ -205,8 +236,8 @@ timer is an incomplete arm.
   overlay alive; ASR speed parity locked vs unlocked), so a lock encountered
   mid-run costs darkness, never safety.
   Do not warn about locks and
-  do not try to prevent them; just size the timed `dark` window so the hold
+  do not try to prevent them; just size the timed window so the hold
   outlives the job. On unattended finishes prefer letting the timed window
   expire over an explicit
-  `off`+`light` while nobody is at the machine - release drops the keepalive and
+  `stop` while nobody is at the machine - release drops the keepalive and
   the box suspends within ~5 min, killing anything still running (2026-11-10, twice).

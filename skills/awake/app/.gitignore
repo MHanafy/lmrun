@@ -1,0 +1,5 @@
+# build output (dotnet publish -c Release -o bin)
+bin/
+# defensive: file-based app intermediates if a toolchain ever writes them here
+obj/
+*.csproj

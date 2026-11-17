@@ -227,14 +227,17 @@ your `runs.jsonl` is untouched; add `--keep-tmp` to inspect the scratch folder a
 
 `skills/awake/` ships the [opencode](https://opencode.ai) skill this workflow relies on for
 long unattended runs on Windows laptops with Modern Standby - machines that freeze or suspend
-compute the moment the display turns off (which is exactly when nobody is watching a
-transcription). It arms a timed PowerToys Awake window plus a detached black pixel-overlay
-process whose `SetThreadExecutionState` hold is the authoritative protection - the overlay
-blacks an OLED without ever asking Windows to power the display down, so neither the OS nor
-the GPU driver engages its screen-off power policy. Includes the renewal-loop timer the agent
-runs as a background job, and `TUNING-NOTES.md` documents the measurement methodology
-(heartbeat probes, Kernel-Power 506/566 events, elevated `powercfg /requests`) that produced
-every number in it. The tuning is Windows 11 + AMD APU + PowerToys specific; treat it as a
+compute the moment the display turns off and silently kill background processes while they do
+(which is exactly when nobody is watching a transcription). The current implementation is a
+single-file C# app (`skills/awake/app/awake.cs`) whose worker injects a no-op F15 keypress for
+its whole run: injected input resets the OS idle timers, so the display never blanks and Modern
+Standby never engages - measured on this box, `SetThreadExecutionState` holds and PowerToys
+Awake do NOT stop idle standby, the keepalive is the mechanism. It can also black an OLED with
+a zero-light pixel overlay (screen physically dark, display logically ON, brightness never
+touched), so neither the OS nor the GPU driver engages its screen-off power policy. Includes
+the renewal-loop timer the agent runs as a background job, and `TUNING-NOTES.md` documents the
+measurement methodology (heartbeat probes, Kernel-Power 506 events, elevated `powercfg /requests`)
+that produced every number in it. The tuning is Windows 11 + AMD APU specific; treat it as a
 worked example of how to diagnose your own machine. Install by placing the folder under
 `~\.config\opencode\skills\awake`.
 

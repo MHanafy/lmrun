@@ -442,3 +442,64 @@ hold + idle/wake state machine + until mailbox. Nothing else.
   {pid,durationMinutes,idleSeconds,heartbeatSeconds,humanHook,until}; zero
   powercfg/WMI writes; SKILL.md doctrine rewritten (OLED verified, don't-lock
   posture, lock-validated facts kept).
+
+## darkkeeper.cs - the C# port (2026-11-17, v6.1): single-file app, mailbox control
+
+- Operator direction: ONE C# file run via `dotnet run` doing everything the ps1
+  pair did (F15 keepalive, dark overlay, timing, status), PLUS: state files moved
+  OUT of the PowerToys folder into the app's own `%LOCALAPPDATA%\DarkKeeper\`,
+  `start` creates the control file / `stop` merely updates it (worker watches and
+  exits ITSELF), heartbeat for the WHOLE process lifetime (v6.1), PowerToys Awake
+  dependency retired (its ES hold measured inert against idle standby; "keeper"
+  mode IS the keep-awake). No guardian/reviver (operator: declined), ps1 pair
+  KEPT as fallback (operator: "not yet" on deleting).
+- .NET 10 file-based app gotchas (SDK 10.0.401), all needed in the directives:
+  `#:property Name=Value` syntax (space form = hard error); `UseWindowsForms=true`
+  + `TargetFramework=net10.0-windows` (plain net10.0 -> NETSDK1136);
+  `PublishAot=false`+`PublishTrimmed=false` (file-based apps default to trimmed/AOT;
+  WinForms rejects -> NETSDK1175); `#:sdk Microsoft.NET.Sdk` works and the legacy
+  `Microsoft.NET.Sdk.WindowsDesktop` name warns NETSDK1137. `SystemEvents` needs the
+  full `Microsoft.Win32.` namespace; `Screen.PrimaryScreen` is nullable-annotated.
+- Real bugs the test cycle caught (kept as lessons):
+  1. `JsonSerializer` silently ignores public FIELDS unless
+     `IncludeFields=true` - the control file serialized as `{}` while every field
+     "looked right" (attributes do not override IncludeFields).
+  2. `Process.GetProcessById(0)` succeeds (System Idle Process) - a pid<=4 guard is
+     required or a broken file reads as "alive".
+  3. The stop-guard must test `intent=="stop"` ONLY: the control file legitimately
+     carries the WORKER's pid (CLI preserves it), so "pid != self => external" is
+     false and swallowed the stop (test escalated to FORCED - correct backstop,
+     wrong trigger).
+  4. **`dotnet run` + detached worker = build-lock**: spawning the worker from the
+     temp build image locks it; the NEXT `dotnet run` (status!) tries to copy
+     apphost.exe over the running image and fails (MSB3026/27 x10). Fix: `start`
+     installs `runtime\darkkeeper.exe` in the state dir and spawns from there; all
+     later verbs use the installed copy; the temp build stays rebuildable.
+- Verified end-to-end (scratch instance, `%TEMP%\opencode\dktest`): start/claim,
+  extend via mailbox (single instance), cooperative stop in 1.2 s with EXIT + file
+  removal, force escalation, DEAD alarm + stale-clear on next start, renew-wait box
+  lifecycle, dark overlay immediate blackout, lifetime KEEPALIVE in BOTH phases,
+  auto-retire `EXIT: retired (window ended)` with zero leftovers. Live PS v6 run
+  (pid 37236) was never disturbed during development (`--state-dir` isolation).
+- Deliberate carry-overs from v6 doctrine: F15 no-op + LLMHF_INJECTED hook filtering;
+  ES sys+away best-effort hold (logged, secondary); dead hooks => stay dark, never
+  thrash; immediate blackout on arm; invariant-culture dates; brightness/sensor
+  writes PERMANENTLY OUT; nothing persists outside the process after a clean stop.
+- RENAMED darkkeeper -> awake (operator: "why the silly name?") right after the
+  publish decision: source `awake.cs`, process/identity `awake`, state dir
+  `%LOCALAPPDATA%\Awake\`, and the build now lives IN THE SOURCE FOLDER at
+  `<skill-dir>\app\bin\` with `app\.gitignore` (bin/, obj/, *.csproj) - operator's
+  call over my habit of parking builds under %LOCALAPPDATA%. Names in the port
+  sections above are the pre-rename ones (kept as history); the retired
+  `%LOCALAPPDATA%\DarkKeeper\darkkeeper.log` is kept for forensics.
+- Ready-to-run EXE (operator: "native AOT"; settled to publish - AOT is a hard NO for
+  WinForms: unsupported by AOT/trimming, and dropping WinForms for raw Win32 buys
+  only startup ms). Self-contained single-file (49 MB) built and verified, then
+  SKIPPED per operator (startup overhead): final shape is FRAMEWORK-DEPENDENT publish
+  `dotnet publish awake.cs -c Release -o app\bin` -> ~200 KB,
+  ~250 ms cold / ~120 ms warm, needs the Windows Desktop runtime (installed on this
+  box). Verified full lifecycle (start/extend/stop/status, real state dir). `start` spawns
+  Environment.ProcessPath when it is a published exe; the runtime-copy install only
+  applies to `dotnet run` temp builds (where the lock problem exists). Late fix to
+  the port: the claiming Save now runs AFTER hook install - initially the CLI could
+  snapshot the claim mid-bootstrap and print a false "human hook dead" warning.
