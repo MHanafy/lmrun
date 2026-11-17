@@ -126,7 +126,11 @@ protection story with the input keepalive: the worker injects a
 no-op F15 keypress every `--heartbeat` (default 30) s - injected input
 resets Windows' display/sleep idle timers, so blanking and Modern Standby never
 engage; wake/re-blank use low-level hooks that see HUMAN input only (injected
-events are filtered, so the heartbeat never wakes the overlay). Since v6.1
+events are filtered, so the heartbeat never wakes the overlay) PLUS, since 2026-11-18,
+a raw-input sink (RIDEV_INPUTSINK, HID digitizer page 0x0D usages 0x04/0x05) on the
+overlay's hidden window - LL hooks are blind to TOUCH (its mouse-emulation carries
+LLMHF_INJECTED), so touch/pen wake only works through that sink; the START log line
+shows `touch sink=True/False`. Since v6.1
 (awake, 2026-11-17) the heartbeat runs for the WHOLE process lifetime.
 Nothing
 persists outside the worker process - the heartbeat stops with it, a kill

@@ -474,6 +474,25 @@ internal static class Native
         [DllImport("user32.dll")] static extern IntPtr SetWindowsHookEx(int idHook, LowLevelProc lpfn, IntPtr hMod, uint dwThreadId);
         [DllImport("user32.dll")] static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
         [DllImport("user32.dll", SetLastError = true)] static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+        [DllImport("user32.dll", SetLastError = true)] static extern bool RegisterRawInputDevices(RAWINPUTDEVICE[] devices, uint numDevices, uint size);
+
+        // Touch/pen digitizers BYPASS the LL keyboard/mouse hooks (and touch's mouse-emulation
+        // is LLMHF_INJECTED-filtered like our own heartbeat), so raw input is the only
+        // system-wide human-touch signal. RIDEV_INPUTSINK delivers to the sink window even
+        // when it is hidden/not foreground (lit phase included). Added 2026-11-18: touch on
+        // the dark overlay now wakes it exactly like keyboard/mouse.
+        [StructLayout(LayoutKind.Sequential)] struct RAWINPUTDEVICE { public ushort usUsagePage; public ushort usUsage; public uint dwFlags; public IntPtr hwndTarget; }
+        const uint RIDEV_INPUTSINK = 0x00000100;
+        public static bool InstallTouchSink(IntPtr hwndTarget)
+        {
+            var rid = new RAWINPUTDEVICE[]
+            {
+                new() { usUsagePage = 0x0D, usUsage = 0x04, dwFlags = RIDEV_INPUTSINK, hwndTarget = hwndTarget }, // HID_DIGITIZER_TOUCH_SCREEN
+                new() { usUsagePage = 0x0D, usUsage = 0x05, dwFlags = RIDEV_INPUTSINK, hwndTarget = hwndTarget }, // HID_DIGITIZER_PEN
+            };
+            return RegisterRawInputDevices(rid, (uint)rid.Length, (uint)Marshal.SizeOf(typeof(RAWINPUTDEVICE)));
+        }
+        public static void Touch() => lastHumanTicks = Environment.TickCount64;
 
         const uint LLMHF_INJECTED = 0x00000001, LLMHF_LOWER_IL_INJECTED = 0x00000002;
         static IntPtr kHook = IntPtr.Zero, mHook = IntPtr.Zero;
@@ -521,6 +540,7 @@ internal static class Native
 
 sealed class Overlay : Form
 {
+    const int WM_INPUT = 0x00FF;
     public Overlay()
     {
         FormBorderStyle = FormBorderStyle.None;
@@ -530,6 +550,12 @@ sealed class Overlay : Form
         TopMost = true;
         ShowInTaskbar = false;
         AutoScaleMode = AutoScaleMode.None;
+    }
+    // any WM_INPUT from the registered digitizer devices = a human touched the screen
+    protected override void WndProc(ref Message m)
+    {
+        if (m.Msg == WM_INPUT) Native.Human.Touch();
+        base.WndProc(ref m);
     }
 }
 
@@ -685,9 +711,11 @@ internal static class Worker
         var _handle = f.Handle;
         hookOk = Native.Human.InstallHooks();
         st.HumanHook = hookOk;
+        bool touchOk = Native.Human.InstallTouchSink(_handle);
         Keeper.Save(o, st);
-        Keeper.Log(o, $"START cs v1: {(o.Dark ? "pixel dark + " : "keeper, ")}LIFETIME F15 keepalive every {o.Heartbeat}s (human hook={hookOk})");
+        Keeper.Log(o, $"START cs v1: {(o.Dark ? "pixel dark + " : "keeper, ")}LIFETIME F15 keepalive every {o.Heartbeat}s (human hook={hookOk}, touch sink={touchOk})");
         if (!hookOk) Keeper.Log(o, "WARNING: human-input hooks NOT installed - overlay stays dark until stop (no self-wake)");
+        if (!touchOk) Keeper.Log(o, "WARNING: touch sink NOT registered - touch will NOT wake the overlay");
         if (st.Mode == "dark") EnterDark();
         t.Start();
 
