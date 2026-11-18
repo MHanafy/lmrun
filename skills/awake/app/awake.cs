@@ -34,6 +34,17 @@
 //   file and the worker exits CLEANLY within ~1 s (force-kill only after 5 s of silence);
 //   the worker polls the file every second. Control file present + pid dead = protection is
 //   GONE (reliable alarm). Nothing persists after a clean stop.
+// - v6.3 (2026-11-18, operator: 'stop gets stuck, only the tray icon dismisses it'): two
+//   mailbox flaws, both proven by reproduction. (1) The worker's per-second mailbox read held
+//   keeper.json with FileShare.READ (no FILE_SHARE_DELETE), so a CLI File.Move(overwrite)
+//   landing in that window died with 'Access to the path is denied' BEFORE logging anything -
+//   stop silently failed while the worker lived (6 tray-stops today, zero mailbox lines).
+//   (2) The 10 s status mirror rewrote the WHOLE control file with a stale seq/intent
+//   (st.Seq never adopted from the mailbox), clobbering a just-written stop. Fixes: every
+//   mailbox/log open uses FileShare ReadWrite|Delete + bounded retry; keeper.json is now
+//   CLI-written ONLY after the worker's one-time claim (status mirror lives in its own
+//   status.json, worker-written); intent=stop is honored EVERY tick regardless of seq; CLI
+//   stop never reports a busy read as 'stopped' and logs its own failures.
 using System;
 using System.Diagnostics;
 using System.Drawing;
@@ -125,9 +136,21 @@ sealed class KeeperState
     [JsonPropertyName("seq")] public long Seq;
     [JsonPropertyName("updatedAt")] public string UpdatedAt = "";
     [JsonPropertyName("startedAt")] public string StartedAt = "";
-    [JsonPropertyName("phase")] public string Phase = "lit";          // worker mirror: "dark" | "lit"
+    [JsonPropertyName("phase")] public string Phase = "lit";          // mirrored from status.json when alive
     [JsonPropertyName("nudges")] public int Nudges;
     [JsonPropertyName("humanHook")] public bool HumanHook;
+}
+
+// Worker-only status mirror (v6.3). Lives in status.json so the worker NEVER rewrites the
+// keeper.json command channel again: the old shared-file mirror clobbered seq/intent and
+// could swallow a just-written stop.
+sealed class StatusMirror
+{
+    [JsonPropertyName("pid")] public int Pid;
+    [JsonPropertyName("phase")] public string Phase = "lit";
+    [JsonPropertyName("nudges")] public int Nudges;
+    [JsonPropertyName("humanHook")] public bool HumanHook;
+    [JsonPropertyName("updatedAt")] public string UpdatedAt = "";
 }
 
 internal static class Keeper
@@ -137,19 +160,90 @@ internal static class Keeper
     public static string StatePath(Opts o) => Path.Combine(o.StateDir, "keeper.json");
     public static string LogPath(Opts o) => Path.Combine(o.StateDir, "awake.log");
     public static string BoxPath(Opts o) => Path.Combine(o.StateDir, "renewtimer.json");
+    public static string StatusPath(Opts o) => Path.Combine(o.StateDir, "status.json");
+
+    // v6.3: Windows refuses to replace/delete a file held open WITHOUT FILE_SHARE_DELETE, and
+    // the default File.ReadAllText shares only Read -> the CLI's File.Move(overwrite) died with
+    // 'Access to the path is denied' whenever it overlapped the worker's 1 s mailbox read or an
+    // AV scan. EVERY mailbox/log open below uses ReadWrite|Delete plus a bounded retry, so a
+    // busy file can neither strand a command nor fake a state change.
+    const FileShare Share = FileShare.ReadWrite | FileShare.Delete;
+
+    public enum ReadResult { Ok, Missing, Failed }
+    public static ReadResult TryReadAllText(string path, out string? text)
+    {
+        for (int i = 0; i < 12; i++)
+        {
+            try
+            {
+                using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, Share);
+                using var sr = new StreamReader(fs);
+                text = sr.ReadToEnd();
+                return ReadResult.Ok;
+            }
+            catch (Exception e)
+            {
+                if (e is FileNotFoundException or DirectoryNotFoundException) { text = null; return ReadResult.Missing; }
+                if (e is not (IOException or UnauthorizedAccessException)) throw;
+                Thread.Sleep(40 + 60 * i);
+            }
+        }
+        text = null;
+        return ReadResult.Failed;
+    }
+
+    public static bool WriteAtomic(string path, string text)
+    {
+        string tmp = path + "." + Environment.ProcessId + ".tmp";
+        for (int i = 0; i < 12; i++)
+        {
+            try
+            {
+                using (var fs = new FileStream(tmp, FileMode.Create, FileAccess.Write, Share))
+                using (var sw = new StreamWriter(fs)) sw.Write(text);
+                File.Move(tmp, path, overwrite: true);
+                return true;
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException) { Thread.Sleep(40 + 60 * i); }
+        }
+        try { File.Delete(tmp); } catch { }
+        return false;
+    }
+
+    public static void TryDelete(string path)
+    {
+        for (int i = 0; i < 12; i++)
+        {
+            try { File.Delete(path); return; }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException) { Thread.Sleep(40 + 60 * i); }
+        }
+    }
 
     public static KeeperState? Load(Opts o)
     {
-        try { return File.Exists(StatePath(o)) ? JsonSerializer.Deserialize<KeeperState>(File.ReadAllText(StatePath(o)), J) : null; }
-        catch { return null; }
+        if (TryReadAllText(StatePath(o), out var txt) != ReadResult.Ok || txt == null) return null;
+        try { return JsonSerializer.Deserialize<KeeperState>(txt, J); } catch { return null; }
     }
 
-    public static void Save(Opts o, KeeperState st)
+    public static bool Save(Opts o, KeeperState st)
     {
         Directory.CreateDirectory(o.StateDir);
-        string tmp = StatePath(o) + "." + Environment.ProcessId + ".tmp";
-        File.WriteAllText(tmp, JsonSerializer.Serialize(st, J));
-        File.Move(tmp, StatePath(o), overwrite: true);
+        return WriteAtomic(StatePath(o), JsonSerializer.Serialize(st, J));
+    }
+
+    public static StatusMirror? LoadStatus(Opts o)
+    {
+        if (TryReadAllText(StatusPath(o), out var txt) != ReadResult.Ok || txt == null) return null;
+        try { return JsonSerializer.Deserialize<StatusMirror>(txt, J); } catch { return null; }
+    }
+    public static void SaveStatus(Opts o, StatusMirror m)
+    {
+        try
+        {
+            Directory.CreateDirectory(o.StateDir);
+            WriteAtomic(StatusPath(o), JsonSerializer.Serialize(m, J));
+        }
+        catch { /* mirror is best-effort */ }
     }
 
     public static void Log(Opts o, string msg)
@@ -157,7 +251,18 @@ internal static class Keeper
         try
         {
             Directory.CreateDirectory(o.StateDir);
-            File.AppendAllText(LogPath(o), $"{DateTime.Now.ToString("s", CultureInfo.InvariantCulture)} [pid {Environment.ProcessId}] {msg}\n");
+            string line = $"{DateTime.Now.ToString("s", CultureInfo.InvariantCulture)} [pid {Environment.ProcessId}] {msg}\n";
+            for (int i = 0; i < 10; i++)
+            {
+                try
+                {
+                    using var fs = new FileStream(LogPath(o), FileMode.Append, FileAccess.Write, Share);
+                    using var sw = new StreamWriter(fs);
+                    sw.Write(line);
+                    return;
+                }
+                catch (Exception e) when (e is IOException or UnauthorizedAccessException) { Thread.Sleep(30 + 50 * i); }
+            }
         }
         catch { /* logging must never take the worker down */ }
     }
@@ -187,11 +292,11 @@ internal static class Keeper
     {
         try
         {
-            if (!File.Exists(BoxPath(o))) return false;
-            var b = JsonSerializer.Deserialize<KeeperState>(File.ReadAllText(BoxPath(o)), J); // pid field reuse
+            if (TryReadAllText(BoxPath(o), out var txt) != ReadResult.Ok || txt == null) return false;
+            var b = JsonSerializer.Deserialize<KeeperState>(txt, J); // pid field reuse
             bool killed = false;
             if (b != null) { try { Process.GetProcessById(b.Pid).Kill(true); killed = true; } catch { } }
-            File.Delete(BoxPath(o));
+            TryDelete(BoxPath(o));
             return killed;
         }
         catch { return false; }
@@ -246,7 +351,12 @@ single-file skipped per operator: extraction/startup overhead.) During developme
             st.Intent = "run";
             st.Seq++;
             st.UpdatedAt = DateTimeOffset.Now.ToString("o", CultureInfo.InvariantCulture);
-            Keeper.Save(o, st);
+            if (!Keeper.Save(o, st))
+            {
+                Keeper.Log(o, $"[cli] EXTEND FAILED: mailbox busy, until NOT pushed (seq={st.Seq}) - worker keeps its old window");
+                Console.Error.WriteLine("awake: could not push the extension (mailbox busy) - the live worker keeps its OLD window; retry.");
+                return 1;
+            }
             Keeper.Log(o, $"[cli] until pushed '{oldUntil}' -> '{st.Until}' seq={st.Seq} mode={st.Mode}");
             Console.WriteLine($"Already RUNNING (pid {alive}, mode {st.Mode}) - EXTENDED until {st.Until} " +
                               "(a live worker is never re-blanked; the mailbox extends it).");
@@ -256,7 +366,8 @@ single-file skipped per operator: extraction/startup overhead.) During developme
 
         if (st != null)
         {
-            try { File.Delete(Keeper.StatePath(o)); } catch { }
+            Keeper.TryDelete(Keeper.StatePath(o));
+            Keeper.TryDelete(Keeper.StatusPath(o));
             Keeper.Log(o, "[cli] stale control file cleared (previous worker died - protection WAS gone)");
             Console.WriteLine("Cleared stale control file (previous worker died - that is the 'protection is GONE' alarm).");
         }
@@ -360,7 +471,8 @@ single-file skipped per operator: extraction/startup overhead.) During developme
         int? alive = Keeper.AlivePid(st);
         if (alive == null)
         {
-            try { File.Delete(Keeper.StatePath(o)); } catch { }
+            Keeper.TryDelete(Keeper.StatePath(o));
+            Keeper.TryDelete(Keeper.StatusPath(o));
             Keeper.Log(o, "[cli] stale control file cleaned by stop");
             Console.WriteLine("Was already dead (stale control file cleaned)." + (timerKilled ? " Pending renewal timer terminated." : ""));
             return 0;
@@ -369,14 +481,28 @@ single-file skipped per operator: extraction/startup overhead.) During developme
         st.Intent = "stop";
         st.Seq++;
         st.UpdatedAt = DateTimeOffset.Now.ToString("o", CultureInfo.InvariantCulture);
-        Keeper.Save(o, st);
+        if (!Keeper.Save(o, st))
+        {
+            Keeper.Log(o, "[cli] stop FAILED: could not write the mailbox (file busy) - worker still RUNNING");
+            Console.Error.WriteLine("awake: stop request NOT delivered (mailbox busy) - the worker is still RUNNING; run 'stop' again.");
+            return 1;
+        }
         Keeper.Log(o, $"[cli] stop requested via mailbox seq={st.Seq}");
 
         for (int i = 0; i < 20; i++)
         {
             Thread.Sleep(250);
-            var c = Keeper.Load(o);
-            if (c == null || Keeper.AlivePid(c) == null)
+            // v6.3: only 'file gone' or 'pid dead' may report a clean stop - a busy read is
+            // unknown, never 'stopped' (the old Load->null lied exactly like the old Move died).
+            var r = Keeper.TryReadAllText(Keeper.StatePath(o), out var txt);
+            bool gone = r == Keeper.ReadResult.Missing;
+            if (!gone && r == Keeper.ReadResult.Ok && txt != null)
+            {
+                KeeperState? c = null;
+                try { c = JsonSerializer.Deserialize<KeeperState>(txt, Keeper.J); } catch { }
+                gone = c != null && Keeper.AlivePid(c) == null;
+            }
+            if (gone)
             {
                 Console.WriteLine("Stopped cleanly (worker acknowledged the mailbox, EXIT logged)." +
                                   (timerKilled ? " Pending renewal timer terminated." : ""));
@@ -384,7 +510,8 @@ single-file skipped per operator: extraction/startup overhead.) During developme
             }
         }
         try { var p = Process.GetProcessById(st.Pid); p.Kill(true); p.WaitForExit(3000); } catch { }
-        try { if (File.Exists(Keeper.StatePath(o))) File.Delete(Keeper.StatePath(o)); } catch { }
+        Keeper.TryDelete(Keeper.StatePath(o));
+        Keeper.TryDelete(Keeper.StatusPath(o));
         Keeper.Log(o, $"[cli] FORCED stop pid={st.Pid} (mailbox not acknowledged within 5 s)");
         Console.WriteLine("Stopped FORCED (worker did not acknowledge the mailbox within 5 s)." +
                           (timerKilled ? " Pending renewal timer terminated." : ""));
@@ -395,6 +522,20 @@ single-file skipped per operator: extraction/startup overhead.) During developme
     {
         var st = Keeper.Load(o);
         int? alive = Keeper.AlivePid(st);
+        if (st == null)
+        {
+            // a busy-but-present file must never print a confident 'OFF' (v6.3)
+            if (Keeper.TryReadAllText(Keeper.StatePath(o), out _) == Keeper.ReadResult.Failed)
+            {
+                Console.WriteLine("Awake: UNKNOWN - control file present but unreadable after retries; re-run 'status'.");
+                return 1;
+            }
+        }
+        else if (alive != null)
+        {
+            var m = Keeper.LoadStatus(o);   // live phase/nudges/hook come from the worker's own mirror
+            if (m != null && m.Pid == st.Pid) { st.Phase = m.Phase; st.Nudges = m.Nudges; st.HumanHook = m.HumanHook; st.UpdatedAt = m.UpdatedAt; }
+        }
         if (o.Json)
         {
             Console.WriteLine(JsonSerializer.Serialize(new StatusOut { State = st, Alive = alive != null }, Keeper.J));
@@ -423,18 +564,21 @@ single-file skipped per operator: extraction/startup overhead.) During developme
         int span = Math.Max(1, o.Minutes - 5);
         var box = new KeeperState { Pid = Environment.ProcessId, Minutes = o.Minutes, UpdatedAt = DateTimeOffset.Now.ToString("o", CultureInfo.InvariantCulture) };
         Directory.CreateDirectory(o.StateDir);
-        File.WriteAllText(Keeper.BoxPath(o), JsonSerializer.Serialize(box, Keeper.J));
+        Keeper.WriteAtomic(Keeper.BoxPath(o), JsonSerializer.Serialize(box, Keeper.J));
         Thread.Sleep(span * 60_000);
-        try
+        if (Keeper.TryReadAllText(Keeper.BoxPath(o), out var txt) == Keeper.ReadResult.Ok && txt != null)
         {
-            var b = JsonSerializer.Deserialize<KeeperState>(File.ReadAllText(Keeper.BoxPath(o)), Keeper.J);
-            if (b != null && b.Pid == Environment.ProcessId)
+            try
             {
-                b.UpdatedAt = DateTimeOffset.Now.ToString("o", CultureInfo.InvariantCulture);
-                File.WriteAllText(Keeper.BoxPath(o), JsonSerializer.Serialize(b, Keeper.J));
+                var b = JsonSerializer.Deserialize<KeeperState>(txt, Keeper.J);
+                if (b != null && b.Pid == Environment.ProcessId)
+                {
+                    b.UpdatedAt = DateTimeOffset.Now.ToString("o", CultureInfo.InvariantCulture);
+                    Keeper.WriteAtomic(Keeper.BoxPath(o), JsonSerializer.Serialize(b, Keeper.J));
+                }
             }
+            catch { }
         }
-        catch { }
         Console.WriteLine($"renewal tick: the armed window expires in ~5 min - still working => 'start --minutes {o.Minutes}' (NO --dark); finished => 'stop'.");
         return 0;
     }
@@ -622,7 +766,13 @@ internal static class Worker
             try { tray?.Dispose(); } catch { } tray = null;
             Cursor.Show();
             Native.Es.Clear();
-            try { var c = Keeper.Load(o); if (c == null || c.Pid == Environment.ProcessId) File.Delete(Keeper.StatePath(o)); } catch { }
+            try
+            {
+                var c = Keeper.Load(o);
+                if (c == null || c.Pid == Environment.ProcessId) Keeper.TryDelete(Keeper.StatePath(o));
+            }
+            catch { }
+            Keeper.TryDelete(Keeper.StatusPath(o));
             Keeper.Log(o, $"EXIT: {why} - nudges={nudges} (cursor + ES released, control file removed)");
             ctx.ExitThread();
         }
@@ -635,25 +785,28 @@ internal static class Worker
             if (shutting) return;
             tick++;
 
-            // mailbox (every second): the control file is the command channel
+            // mailbox (every second): keeper.json is the command channel - CLI-written only
+            // after our one-time claim (v6.3). A transient read failure RETRIES next tick; only
+            // a definitely-gone file counts as stop (the old code killed the worker on a busy read).
+            var mr = Keeper.TryReadAllText(Keeper.StatePath(o), out var mtxt);
+            if (mr == Keeper.ReadResult.Failed) { Keeper.Log(o, $"mailbox read failed (tick {tick}) - retrying, staying armed"); return; }
+            if (mr == Keeper.ReadResult.Missing) { Cleanup("control file removed (treated as stop)"); return; }
             KeeperState? ex = null;
-            bool fileGone = false;
-            try
+            try { ex = JsonSerializer.Deserialize<KeeperState>(mtxt!, Keeper.J); }
+            catch (Exception mx) { Keeper.Log(o, $"mailbox parse failed (tick {tick}): {mx.Message}"); return; }
+            if (ex == null) { Keeper.Log(o, $"mailbox empty (tick {tick}) - retrying"); return; }
+
+            // v6.3: stop is IDEMPOTENT - honored on every tick, not only on a seq change, so a
+            // lost/duplicated seq can never strand this worker in 'run' against a stopped mailbox.
+            if (string.Equals(ex.Intent, "stop", StringComparison.OrdinalIgnoreCase))
             {
-                if (File.Exists(Keeper.StatePath(o))) ex = Keeper.Load(o);
-                else fileGone = true;
+                Cleanup("stop requested via mailbox");
+                return;
             }
-            catch (Exception mx) { Keeper.Log(o, $"mailbox read failed (tick {tick}): {mx.Message}"); }
-            if (fileGone || ex == null) { Cleanup("control file removed (treated as stop)"); return; }
 
             if (ex.Seq != lastSeq)
             {
                 lastSeq = ex.Seq;
-                if (string.Equals(ex.Intent, "stop", StringComparison.OrdinalIgnoreCase))
-                {
-                    Cleanup("stop requested via mailbox");
-                    return;
-                }
                 if (!string.Equals(ex.Until, st.Until, StringComparison.Ordinal))
                 {
                     Keeper.Log(o, $"until mailbox: '{st.Until}' -> '{ex.Until}' (tick {tick})");
@@ -697,12 +850,16 @@ internal static class Worker
             }
             if (isDark) f.TopMost = true;
 
-            if (tick % 10 == 0)   // light status mirror for 'status' (own seq stays)
+            if (tick % 10 == 0)   // status mirror -> status.json ONLY (v6.3: keeper.json is CLI-write-only)
             {
-                st.Phase = isDark ? "dark" : "lit";
-                st.Nudges = nudges;
-                st.UpdatedAt = DateTimeOffset.Now.ToString("o", CultureInfo.InvariantCulture);
-                try { Keeper.Save(o, st); } catch { }
+                Keeper.SaveStatus(o, new StatusMirror
+                {
+                    Pid = Environment.ProcessId,
+                    Phase = isDark ? "dark" : "lit",
+                    Nudges = nudges,
+                    HumanHook = hookOk,
+                    UpdatedAt = DateTimeOffset.Now.ToString("o", CultureInfo.InvariantCulture),
+                });
                 tray?.Update(isDark);
             }
         };
@@ -712,8 +869,8 @@ internal static class Worker
         hookOk = Native.Human.InstallHooks();
         st.HumanHook = hookOk;
         bool touchOk = Native.Human.InstallTouchSink(_handle);
-        Keeper.Save(o, st);
-        Keeper.Log(o, $"START cs v1: {(o.Dark ? "pixel dark + " : "keeper, ")}LIFETIME F15 keepalive every {o.Heartbeat}s (human hook={hookOk}, touch sink={touchOk})");
+        if (!Keeper.Save(o, st)) { Keeper.Log(o, "RUN aborted: could not claim the control file (busy)"); return 1; }
+        Keeper.Log(o, $"START cs v6.3: {(o.Dark ? "pixel dark + " : "keeper, ")}LIFETIME F15 keepalive every {o.Heartbeat}s (human hook={hookOk}, touch sink={touchOk})");
         if (!hookOk) Keeper.Log(o, "WARNING: human-input hooks NOT installed - overlay stays dark until stop (no self-wake)");
         if (!touchOk) Keeper.Log(o, "WARNING: touch sink NOT registered - touch will NOT wake the overlay");
         if (st.Mode == "dark") EnterDark();
