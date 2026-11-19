@@ -61,6 +61,15 @@
 //   regardless of hook state; (c) the journal logs 'ALARM: ... hooks missed' when the
 //   session clock saw input while the hook clock did not - the blindness fingerprint; (d) LL
 //   hooks are reinstalled every 60 s as self-heal against silent removal.
+// - v6.4.1 (2026-11-19, operator: "hide instead of closing if it doesn't auto-hide"): the
+//   tray menu gains 'Hide black screen (keep armed)', shown while the overlay is dark (and
+//   for 5 s after - opening the tray is itself an input that wakes it a beat before the
+//   menu paints). It dismisses the screen and DEMOTES the run to keeper (never
+//   re-blanks) while the keepalive/heartbeat/renewal stay armed - the middle escape hatch
+//   between 'it woke itself' and 'Stop awake'. The demote is operator authority: later
+//   mailbox writes of mode=dark are ignored (logged) until the run is stopped and re-armed.
+//   The worker's authoritative mode rides the status.json mirror so 'status' reports the
+//   truth after a hide, and every dismiss is greppable as 'WAKE (HIDE from tray ...)'.
 using System;
 using System.Collections.Concurrent;
 using System.Diagnostics;
@@ -161,11 +170,13 @@ sealed class KeeperState
 
 // Worker-only status mirror (v6.3). Lives in status.json so the worker NEVER rewrites the
 // keeper.json command channel again: the old shared-file mirror clobbered seq/intent and
-// could swallow a just-written stop.
+// could swallow a just-written stop. Mode added v6.4.1: the worker's authoritative mode
+// (a tray Hide flips it to keeper without touching keeper.json, which is CLI-write-only).
 sealed class StatusMirror
 {
     [JsonPropertyName("pid")] public int Pid;
     [JsonPropertyName("phase")] public string Phase = "lit";
+    [JsonPropertyName("mode")] public string Mode = "keeper";
     [JsonPropertyName("nudges")] public int Nudges;
     [JsonPropertyName("humanHook")] public bool HumanHook;
     [JsonPropertyName("updatedAt")] public string UpdatedAt = "";
@@ -376,7 +387,9 @@ awake - keep-awake + zero-light dark overlay (files: %LOCALAPPDATA%\Awake\)
   stop  cooperative stop: flips the mailbox; the worker exits itself (force-kill after 5 s).
         The worker also shows a tray icon (status tooltip + Hide + Open log + Stop) while
         running; --no-tray hides it. 'Hide black screen (keep armed)' appears in the menu
-        ONLY while the overlay is dark: manual dismiss that keeps the keepalive running.
+        only around a dark phase: dismisses the black screen for good this run (the
+        worker demotes to keeper, never re-blanks) while the keepalive stays armed.
+        Re-arm dark with: stop, then start --dark.
         In dark phase the overlay covers the taskbar - any human input wakes it first,
         THEN the tray is reachable.
   status [--json]
@@ -587,8 +600,12 @@ single-file skipped per operator: extraction/startup overhead.) During developme
         }
         else if (alive != null)
         {
-            var m = Keeper.LoadStatus(o);   // live phase/nudges/hook come from the worker's own mirror
-            if (m != null && m.Pid == st.Pid) { st.Phase = m.Phase; st.Nudges = m.Nudges; st.HumanHook = m.HumanHook; st.UpdatedAt = m.UpdatedAt; }
+            var m = Keeper.LoadStatus(o);   // live phase/nudges/hook/MODE come from the worker's own mirror
+            if (m != null && m.Pid == st.Pid)
+            {
+                st.Phase = m.Phase; st.Nudges = m.Nudges; st.HumanHook = m.HumanHook; st.UpdatedAt = m.UpdatedAt;
+                st.Mode = m.Mode;   // a tray Hide made keeper: report the truth, not the stale mailbox
+            }
         }
         if (o.Json)
         {
@@ -827,6 +844,16 @@ internal static class Worker
         var ctx = new ApplicationContext(f);
         var t = new System.Windows.Forms.Timer { Interval = 1000 };
         bool hookOk = false, isDark = false, shutting = false;
+        // v6.4.1: tray 'Hide black screen' is OPERATOR AUTHORITY for this run - once hidden,
+        // the worker demotes itself to keeper (never re-blanks) and a later CLI extend writing
+        // mode=dark into the mailbox must NOT re-arm the dark phase (stop + start --dark to re-arm).
+        bool hidden = false;
+        // Opening the tray menu is itself a human input, so the overlay usually wakes a beat
+        // BEFORE the menu paints and a strict 'isDark now' check would hide 'Hide' at the exact
+        // moment it is needed. Grace: the item also shows within 5 s of leaving the dark phase
+        // (still dark from the user's point of view; keeper-only runs never retrigger it because
+        // EnterLit only fires during dark phases).
+        long lastDarkEnd = 0;
         int tick = 0, nudges = 0;
         long lastSeq = -1;
         TrayUi? tray = null;
@@ -840,7 +867,7 @@ internal static class Worker
         Keeper.ReadResult mres = Keeper.ReadResult.Failed;   // Failed == 'no fresh read yet'
         KeeperState? mst = null;
         int[] stopFlag = new int[1];                         // 0 = run, 1 = exit (via Volatile)
-        string phaseNow = "lit"; int nudgesNow = 0; bool hookOkNow = false;   // guarded by mlock
+        string phaseNow = "lit"; int nudgesNow = 0; bool hookOkNow = false; string modeNow = "keeper";   // guarded by mlock
 
         void MarkShutting()
         {
@@ -859,6 +886,7 @@ internal static class Worker
         void EnterLit(string why = "human input")
         {
             isDark = false;
+            lastDarkEnd = Environment.TickCount64;
             f.Hide();
             Cursor.Show();
             Keeper.Log(o, $"WAKE ({why})");
@@ -930,9 +958,14 @@ internal static class Worker
                 if (ex.IdleSeconds >= 15 && ex.IdleSeconds != st.IdleSeconds) st.IdleSeconds = ex.IdleSeconds;
                 if (ex.Mode != st.Mode)
                 {
-                    Keeper.Log(o, $"mode mailbox: '{st.Mode}' -> '{ex.Mode}'");
-                    st.Mode = ex.Mode;
-                    if (st.Mode == "dark") EnterDark(); else EnterLit();
+                    if (hidden && ex.Mode == "dark")
+                        Keeper.Log(o, "ignoring mailbox mode 'dark': operator hid the black screen this run (stop + start --dark to re-arm dark)");
+                    else
+                    {
+                        Keeper.Log(o, $"mode mailbox: '{st.Mode}' -> '{ex.Mode}'");
+                        st.Mode = ex.Mode;
+                        if (st.Mode == "dark") EnterDark(); else EnterLit("mode change");
+                    }
                 }
             }
 
@@ -980,7 +1013,7 @@ internal static class Worker
             if (isDark) f.TopMost = true;
 
             // keeper.json/status.json are NEVER written on this thread (v6.4) - snapshot for the watcher
-            lock (mlock) { phaseNow = isDark ? "dark" : "lit"; nudgesNow = nudges; hookOkNow = hookOk; }
+            lock (mlock) { phaseNow = isDark ? "dark" : "lit"; nudgesNow = nudges; hookOkNow = hookOk; modeNow = st.Mode; }
 
             if (tick % 10 == 0) tray?.Update(isDark);
 
@@ -1000,7 +1033,7 @@ internal static class Worker
         st.HumanHook = hookOk;
         bool touchOk = Native.Human.InstallTouchSink(_handle);
         if (!Keeper.Save(o, st)) { Keeper.Log(o, "RUN aborted: could not claim the control file (busy)"); Keeper.Flush(); return 1; }
-        Keeper.Log(o, $"START cs v6.4: {(o.Dark ? "pixel dark + " : "keeper, ")}LIFETIME F15 keepalive every {o.Heartbeat}s (human hook={hookOk}, touch sink={touchOk}, session cross-check + bg mailbox on)");
+        Keeper.Log(o, $"START cs v6.4.1: {(o.Dark ? "pixel dark + " : "keeper, ")}LIFETIME F15 keepalive every {o.Heartbeat}s (human hook={hookOk}, touch sink={touchOk}, session cross-check + bg mailbox on)");
         if (!hookOk) Keeper.Log(o, "WARNING: human-input hooks NOT installed - wakes rely on session-input cross-check");
         if (!touchOk) Keeper.Log(o, "WARNING: touch sink NOT registered - touch will NOT wake the overlay");
 
@@ -1025,13 +1058,14 @@ internal static class Worker
                 if (++mirrorCd >= 10 && Volatile.Read(ref stopFlag[0]) == 0)
                 {
                     mirrorCd = 0;
-                    string ph; int nud; bool hook;
-                    lock (mlock) { ph = phaseNow; nud = nudgesNow; hook = hookOkNow; }
+                    string ph; int nud; bool hook; string md;
+                    lock (mlock) { ph = phaseNow; nud = nudgesNow; hook = hookOkNow; md = modeNow; }
                     if (ph != "exiting")
                         Keeper.SaveStatus(o, new StatusMirror
                         {
                             Pid = Environment.ProcessId,
                             Phase = ph,
+                            Mode = md,
                             Nudges = nud,
                             HumanHook = hook,
                             UpdatedAt = DateTimeOffset.Now.ToString("o", CultureInfo.InvariantCulture),
@@ -1052,8 +1086,8 @@ internal static class Worker
             {
                 tray = new TrayUi(Keeper.LogPath(o),
                     () => $"awake - {(st.Mode == "dark" ? "dark+keeper" : "keeper")} - {(isDark ? "DARK" : "lit")} - nudge #{nudges} - retires {RetireLabel()}",
-                    () => isDark,
-                    () => { Native.Human.Touch(); if (isDark) EnterLit("HIDE from tray - black screen dismissed by hand, keepalive STAYS ARMED; re-blanks after idle"); },
+                    () => isDark || (Environment.TickCount64 - lastDarkEnd) < 5000,
+                    () => { if (hidden) return; hidden = true; st.Mode = "keeper"; EnterLit("HIDE from tray - black screen dismissed by hand; keepalive STAYS ARMED, no more darkening this run"); tray?.Update(false); },
                     () => Cleanup("stop requested from tray"));
                 tray.Balloon($"Armed ({st.Mode}): F15 keep-awake live, retires {RetireLabel()}. Hide/Stop from this menu.");
             }
@@ -1067,8 +1101,10 @@ internal static class Worker
 
 // Tray icon for the live worker: at-a-glance status (tooltip + menu header), a manual
 // 'Hide overlay' dismiss (visible ONLY while the black screen is on - the escape hatch for
-// an overlay that refuses to auto-hide; keepalive stays armed) and a one-click cooperative
-// stop, so the console can stay hidden. Pure notification - it touches NONE of the
+// an overlay that refuses to auto-hide: it demotes this run to keeper so it never
+// re-blanks, while keepalive stays armed) and a one-click cooperative stop, so the
+// console can stay hidden. The dismiss is operator authority: the worker then IGNORES
+// mailbox attempts to re-enter dark (see 'hidden' in Worker.Run). It touches NONE of the
 // protection path (heartbeat/hooks/mailbox unchanged); Stop reuses the exact cooperative
 // Cleanup() the CLI mailbox uses. CAVEAT (by design): during the dark phase the overlay
 // covers the taskbar (zero-light doctrine), so the tray is only clickable after human
