@@ -45,7 +45,24 @@
 //   CLI-written ONLY after the worker's one-time claim (status mirror lives in its own
 //   status.json, worker-written); intent=stop is honored EVERY tick regardless of seq; CLI
 //   stop never reports a busy read as 'stopped' and logs its own failures.
+// - v6.4 (2026-11-19, operator: 'stuck black screen, mouse/kb/touch all ignored'): the
+//   journal shows a HEALTHY worker receiving ZERO input events for 40 s - 14 min stretches
+//   (idle clock advances exactly +30 s per heartbeat) while the same hooks record real input
+//   minutes before and after - no session-lock, standby or device events anywhere near it.
+//   That is the Windows behavior of SKIPPING LL-hook callbacks while the installing thread
+//   blocks past LowLevelHooksTimeout (~300 ms): the old tick did mailbox file IO + logging
+//   ON THE UI THREAD, so any disk/AV interference starves the hooks and the dark overlay
+//   becomes input-blind until the interference stops (first delivered input wakes it - which
+//   is why the taskbar click always 'fixed' it). Fixes: (a) the worker's UI thread performs
+//   NO file IO at all - mailbox polling, parsing, status-mirror writes and log writes moved
+//   to background threads; the 1 s tick consumes a snapshot; (b) GetLastInputInfo (win32k's
+//   session-wide input clock, unaffected by hook skipping/removal/IL) cross-checks every
+//   tick: any advance past our own heartbeat's baseline is a human and wakes the overlay
+//   regardless of hook state; (c) the journal logs 'ALARM: ... hooks missed' when the
+//   session clock saw input while the hook clock did not - the blindness fingerprint; (d) LL
+//   hooks are reinstalled every 60 s as self-heal against silent removal.
 using System;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Drawing;
 using System.Globalization;
@@ -84,6 +101,7 @@ internal static class Program
             Console.Error.WriteLine("awake: " + e.Message);
             return 1;
         }
+        finally { Keeper.Flush(); }   // async journal (v6.4): never exit with lines still queued
     }
     static int Err(Opts o) { Console.Error.WriteLine($"unknown verb '{o.Verb}'"); Cli.Help(); return 2; }
 }
@@ -246,25 +264,59 @@ internal static class Keeper
         catch { /* mirror is best-effort */ }
     }
 
+    // Journal is ASYNC (v6.4): callers only enqueue - the actual (retrying, shared-safe)
+    // append happens on a background thread so the worker's UI thread NEVER touches a file.
+    // Flush() before any process exit; the thread is background, so a forgotten Flush only
+    // costs trailing lines, never a hang.
+    static readonly ConcurrentQueue<string> LogQ = new();
+    static Thread? logThread;
+    static Opts? logOpts;
+
     public static void Log(Opts o, string msg)
     {
-        try
+        LogQ.Enqueue($"{DateTime.Now.ToString("s", CultureInfo.InvariantCulture)} [pid {Environment.ProcessId}] {msg}\n");
+        lock (LogQ)
         {
-            Directory.CreateDirectory(o.StateDir);
-            string line = $"{DateTime.Now.ToString("s", CultureInfo.InvariantCulture)} [pid {Environment.ProcessId}] {msg}\n";
-            for (int i = 0; i < 10; i++)
+            logOpts = o;   // one state dir per process (CLI and worker each use exactly one)
+            if (logThread == null)
             {
-                try
-                {
-                    using var fs = new FileStream(LogPath(o), FileMode.Append, FileAccess.Write, Share);
-                    using var sw = new StreamWriter(fs);
-                    sw.Write(line);
-                    return;
-                }
-                catch (Exception e) when (e is IOException or UnauthorizedAccessException) { Thread.Sleep(30 + 50 * i); }
+                var th = new Thread(LoggerLoop) { IsBackground = true, Name = "awake-log" };
+                logThread = th;
+                th.Start();
             }
         }
-        catch { /* logging must never take the worker down */ }
+    }
+
+    static void LoggerLoop()
+    {
+        while (true) { DrainOnce(); Thread.Sleep(60); }
+    }
+
+    static void DrainOnce()
+    {
+        var o = logOpts;
+        if (o == null) return;
+        var sb = new StringBuilder();
+        while (LogQ.TryDequeue(out var l)) sb.Append(l);
+        if (sb.Length == 0) return;
+        for (int i = 0; i < 10; i++)
+        {
+            try
+            {
+                Directory.CreateDirectory(o.StateDir);
+                using var fs = new FileStream(LogPath(o), FileMode.Append, FileAccess.Write, Share);
+                using var sw = new StreamWriter(fs);
+                sw.Write(sb.ToString());
+                return;
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException) { Thread.Sleep(50 + 50 * i); }
+        }
+        LogQ.Enqueue(sb.ToString());   // best-effort: never lose, order may skew under lock storms
+    }
+
+    public static void Flush()
+    {
+        for (int i = 0; i < 12 && !LogQ.IsEmpty; i++) DrainOnce();
     }
 
     // pid + start-time match (immune to pid reuse)
@@ -616,6 +668,7 @@ internal static class Native
     {
         delegate IntPtr LowLevelProc(int nCode, IntPtr wParam, IntPtr lParam);
         [DllImport("user32.dll")] static extern IntPtr SetWindowsHookEx(int idHook, LowLevelProc lpfn, IntPtr hMod, uint dwThreadId);
+        [DllImport("user32.dll")] static extern bool UnhookWindowsHookEx(IntPtr hhk);
         [DllImport("user32.dll")] static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
         [DllImport("user32.dll", SetLastError = true)] static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
         [DllImport("user32.dll", SetLastError = true)] static extern bool RegisterRawInputDevices(RAWINPUTDEVICE[] devices, uint numDevices, uint size);
@@ -637,6 +690,29 @@ internal static class Native
             return RegisterRawInputDevices(rid, (uint)rid.Length, (uint)Marshal.SizeOf(typeof(RAWINPUTDEVICE)));
         }
         public static void Touch() => lastHumanTicks = Environment.TickCount64;
+
+        // ---- v6.4: win32k session-input cross-check (immune to LL-hook skipping/removal/IL) ----
+        // GetLastInputInfo reports the session's last input tick at win32k level: it advances
+        // for ANY input - including input our hooks were starved of (UI-thread stall beyond
+        // LowLevelHooksTimeout makes Windows skip our callbacks: the 'stuck black screen'
+        // fingerprint). Our own heartbeat F15 also advances it, so the baseline is re-read
+        // right after every Nudge; any later advance can only be a human.
+        [StructLayout(LayoutKind.Sequential)] struct LASTINPUTINFO { public uint cbSize; public uint dwTime; }
+        [DllImport("user32.dll")] static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
+        static uint GllNow()
+        {
+            var lii = new LASTINPUTINFO { cbSize = (uint)Marshal.SizeOf<LASTINPUTINFO>() };
+            return GetLastInputInfo(ref lii) ? lii.dwTime : 0;
+        }
+        public static double GlIdleSeconds() => unchecked((uint)((uint)Environment.TickCount64 - GllNow())) / 1000.0;
+
+        // A human is present when the win32k session idle is meaningfully SMALLER than the time
+        // since our OWN last injection - only extra input can pull the session clock back ahead
+        // of our heartbeat. The 2 s margin absorbs SendInput registration lag, so our F15 can
+        // never fake a human, and a starved LL hook cannot hide one. (v6.4 recovery path.)
+        public static long LastNudgeTicks = Environment.TickCount64;   // UI-thread only, no volatile needed
+        public static bool HumanBySession() =>
+            GlIdleSeconds() < (Environment.TickCount64 - LastNudgeTicks) / 1000.0 - 2.0;
 
         const uint LLMHF_INJECTED = 0x00000001, LLMHF_LOWER_IL_INJECTED = 0x00000002;
         static IntPtr kHook = IntPtr.Zero, mHook = IntPtr.Zero;
@@ -664,6 +740,18 @@ internal static class Native
             mHook = SetWindowsHookEx(14 /*WH_MOUSE_LL*/, mProc!, IntPtr.Zero, 0);
             return kHook != IntPtr.Zero || mHook != IntPtr.Zero;
         }
+
+        // v6.4 self-heal: periodic unhook+reinstall guards against silent hook removal.
+        // Delivery gap is ~ms and harmless: the GLLII cross-check covers wakes meanwhile.
+        public static bool ReinstallHooks()
+        {
+            if (kProc == null) return InstallHooks();
+            if (kHook != IntPtr.Zero) { UnhookWindowsHookEx(kHook); kHook = IntPtr.Zero; }
+            if (mHook != IntPtr.Zero) { UnhookWindowsHookEx(mHook); mHook = IntPtr.Zero; }
+            kHook = SetWindowsHookEx(13, kProc, IntPtr.Zero, 0);
+            mHook = SetWindowsHookEx(14, mProc!, IntPtr.Zero, 0);
+            return kHook != IntPtr.Zero || mHook != IntPtr.Zero;
+        }
         public static double IdleSeconds => (Environment.TickCount64 - lastHumanTicks) / 1000.0;
 
         [StructLayout(LayoutKind.Sequential)] struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
@@ -678,6 +766,9 @@ internal static class Native
             a[0].type = INPUT_KEYBOARD; a[0].u.ki.wVk = VK_F15;
             a[1].type = INPUT_KEYBOARD; a[1].u.ki.wVk = VK_F15; a[1].u.ki.dwFlags = KEYEVENTF_KEYUP;
             SendInput((uint)a.Length, a, Marshal.SizeOf(typeof(INPUT)));
+            // our own injection advances the session clock; stamp it so HumanBySession only
+            // reports input that arrived AFTER this heartbeat (i.e. a real human).
+            LastNudgeTicks = Environment.TickCount64;
         }
     }
 }
@@ -738,6 +829,23 @@ internal static class Worker
         long lastSeq = -1;
         TrayUi? tray = null;
 
+        // ---- v6.4: file IO never runs on the UI thread (hook starvation fix) ----
+        // keeper.json read + status.json write live on this watcher thread; the 1 s tick only
+        // consumes the snapshot. A blocking read here (AV, disk spin-up, sharing storm) can no
+        // longer push the UI thread past LowLevelHooksTimeout, which is what used to make
+        // Windows silently SKIP our LL-hook callbacks => the 'stuck black screen'.
+        var mlock = new object();
+        Keeper.ReadResult mres = Keeper.ReadResult.Failed;   // Failed == 'no fresh read yet'
+        KeeperState? mst = null;
+        int[] stopFlag = new int[1];                         // 0 = run, 1 = exit (via Volatile)
+        string phaseNow = "lit"; int nudgesNow = 0; bool hookOkNow = false;   // guarded by mlock
+
+        void MarkShutting()
+        {
+            Volatile.Write(ref stopFlag[0], 1);
+            lock (mlock) { phaseNow = "exiting"; }
+        }
+
         void EnterDark()
         {
             if (shutting) return;
@@ -763,6 +871,7 @@ internal static class Worker
             if (shutting) return;
             shutting = true;
             t.Stop();
+            MarkShutting();   // watcher stops touching status.json
             try { tray?.Dispose(); } catch { } tray = null;
             Cursor.Show();
             Native.Es.Clear();
@@ -774,27 +883,26 @@ internal static class Worker
             catch { }
             Keeper.TryDelete(Keeper.StatusPath(o));
             Keeper.Log(o, $"EXIT: {why} - nudges={nudges} (cursor + ES released, control file removed)");
+            Keeper.Flush();   // async journal: make sure EXIT lands before the process dies
             ctx.ExitThread();
         }
 
         Microsoft.Win32.SystemEvents.SessionSwitch += (s, e) => Keeper.Log(o, "WTS: " + e.Reason);
         f.FormClosing += (s, e) => { if (!shutting) { Cleanup("window closed"); e.Cancel = true; } };
 
+        int lastAlarmTick = -999;
         t.Tick += (s, e) =>
         {
             if (shutting) return;
             tick++;
 
-            // mailbox (every second): keeper.json is the command channel - CLI-written only
-            // after our one-time claim (v6.3). A transient read failure RETRIES next tick; only
-            // a definitely-gone file counts as stop (the old code killed the worker on a busy read).
-            var mr = Keeper.TryReadAllText(Keeper.StatePath(o), out var mtxt);
-            if (mr == Keeper.ReadResult.Failed) { Keeper.Log(o, $"mailbox read failed (tick {tick}) - retrying, staying armed"); return; }
+            // mailbox: CONSUME the watcher's snapshot (v6.4 - zero file IO on the UI thread;
+            // a busy/absent-moment read is retried a second later, never fatal, and only a
+            // definitely-gone file counts as stop).
+            Keeper.ReadResult mr; KeeperState? ex;
+            lock (mlock) { mr = mres; ex = mst; }
             if (mr == Keeper.ReadResult.Missing) { Cleanup("control file removed (treated as stop)"); return; }
-            KeeperState? ex = null;
-            try { ex = JsonSerializer.Deserialize<KeeperState>(mtxt!, Keeper.J); }
-            catch (Exception mx) { Keeper.Log(o, $"mailbox parse failed (tick {tick}): {mx.Message}"); return; }
-            if (ex == null) { Keeper.Log(o, $"mailbox empty (tick {tick}) - retrying"); return; }
+            if (mr == Keeper.ReadResult.Failed || ex == null) return;   // no fresh read yet - stay armed
 
             // v6.3: stop is IDEMPOTENT - honored on every tick, not only on a seq change, so a
             // lost/duplicated seq can never strand this worker in 'run' against a stopped mailbox.
@@ -838,29 +946,49 @@ internal static class Worker
             {
                 Native.Human.Nudge();
                 nudges++;
-                Keeper.Log(o, $"KEEPALIVE #{nudges} F15 injected (human idle {HumanIdleLabel()}, phase {(isDark ? "dark" : "lit")})");
+                Keeper.Log(o, $"KEEPALIVE #{nudges} F15 injected (human idle {HumanIdleLabel()}, session idle {Native.Human.GlIdleSeconds():n0}s, phase {(isDark ? "dark" : "lit")})");
+            }
+
+            // v6.4 RECOVERY: the win32k session clock saw a human but our hook clock missed them
+            // (LL callbacks starved by a UI-thread stall, or a silently dropped hook) - feed the
+            // idle clock so the dark cycle wakes and does NOT re-blank underneath them, and log
+            // ALARM (the blindness fingerprint the operator's stuck-black reports were missing).
+            if (Native.Human.HumanBySession())
+            {
+                double hookIdle = hookOk ? Native.Human.IdleSeconds : 9999;
+                if (hookIdle > 60 && tick - lastAlarmTick > 60)
+                {
+                    lastAlarmTick = tick;
+                    Keeper.Log(o, $"ALARM: input-blind hooks (hook idle {hookIdle:n0}s but session clock sees input; hookOk={hookOk}) - woke via session clock, reinstalling");
+                    hookOk = Native.Human.ReinstallHooks();
+                }
+                Native.Human.Touch();
             }
 
             // dark/active cycle (dark mode only; dead hooks => stay dark, never thrash)
-            double idle = hookOk ? Native.Human.IdleSeconds : -1;
-            if (st.Mode == "dark" && idle >= 0)
+            // dark/active cycle. v6.4: the idle clock is fed by hook input AND the session-clock
+            // cross-check, so it tracks humans even with dead hooks - use it unconditionally
+            // (the old 'dead hooks => stay dark' doctrine is what made stuck-dark unrecoverable).
+            double idle = Native.Human.IdleSeconds;
+            if (st.Mode == "dark")
             {
                 if (isDark && idle < 1) EnterLit();
                 else if (!isDark && idle >= st.IdleSeconds) EnterDark();
             }
             if (isDark) f.TopMost = true;
 
-            if (tick % 10 == 0)   // status mirror -> status.json ONLY (v6.3: keeper.json is CLI-write-only)
+            // keeper.json/status.json are NEVER written on this thread (v6.4) - snapshot for the watcher
+            lock (mlock) { phaseNow = isDark ? "dark" : "lit"; nudgesNow = nudges; hookOkNow = hookOk; }
+
+            if (tick % 10 == 0) tray?.Update(isDark);
+
+            // v6.4 self-heal vs silent hook removal (~ms delivery gap; the session cross-check
+            // covers wakes during it anyway)
+            if (tick % 60 == 0)
             {
-                Keeper.SaveStatus(o, new StatusMirror
-                {
-                    Pid = Environment.ProcessId,
-                    Phase = isDark ? "dark" : "lit",
-                    Nudges = nudges,
-                    HumanHook = hookOk,
-                    UpdatedAt = DateTimeOffset.Now.ToString("o", CultureInfo.InvariantCulture),
-                });
-                tray?.Update(isDark);
+                bool rok = Native.Human.ReinstallHooks();
+                if (rok != hookOk) Keeper.Log(o, rok ? "hooks recovered after reinstall" : "WARNING: hook reinstall FAILED - wakes rely on session-input cross-check");
+                hookOk = rok;
             }
         };
 
@@ -869,10 +997,51 @@ internal static class Worker
         hookOk = Native.Human.InstallHooks();
         st.HumanHook = hookOk;
         bool touchOk = Native.Human.InstallTouchSink(_handle);
-        if (!Keeper.Save(o, st)) { Keeper.Log(o, "RUN aborted: could not claim the control file (busy)"); return 1; }
-        Keeper.Log(o, $"START cs v6.3: {(o.Dark ? "pixel dark + " : "keeper, ")}LIFETIME F15 keepalive every {o.Heartbeat}s (human hook={hookOk}, touch sink={touchOk})");
-        if (!hookOk) Keeper.Log(o, "WARNING: human-input hooks NOT installed - overlay stays dark until stop (no self-wake)");
+        if (!Keeper.Save(o, st)) { Keeper.Log(o, "RUN aborted: could not claim the control file (busy)"); Keeper.Flush(); return 1; }
+        Keeper.Log(o, $"START cs v6.4: {(o.Dark ? "pixel dark + " : "keeper, ")}LIFETIME F15 keepalive every {o.Heartbeat}s (human hook={hookOk}, touch sink={touchOk}, session cross-check + bg mailbox on)");
+        if (!hookOk) Keeper.Log(o, "WARNING: human-input hooks NOT installed - wakes rely on session-input cross-check");
         if (!touchOk) Keeper.Log(o, "WARNING: touch sink NOT registered - touch will NOT wake the overlay");
+
+        // v6.4 watcher thread: 1 s mailbox poll + ~10 s status mirror, ALL file IO off the UI
+        // thread (hook-starvation guard). Snapshot consumed by t.Tick under mlock.
+        var mboxThread = new Thread(() =>
+        {
+            int mirrorCd = 0, fails = 0;
+            while (Volatile.Read(ref stopFlag[0]) == 0)
+            {
+                var r = Keeper.TryReadAllText(Keeper.StatePath(o), out var txt);
+                KeeperState? parsed = null;
+                if (r == Keeper.ReadResult.Ok && txt != null)
+                {
+                    try { parsed = JsonSerializer.Deserialize<KeeperState>(txt, Keeper.J); } catch { }
+                    if (parsed == null) r = Keeper.ReadResult.Failed;
+                }
+                lock (mlock) { mres = r; mst = parsed; }
+                if (r == Keeper.ReadResult.Failed) { if (++fails % 30 == 1) Keeper.Log(o, $"mailbox read/parse failed x{fails} - staying armed"); }
+                else fails = 0;
+
+                if (++mirrorCd >= 10 && Volatile.Read(ref stopFlag[0]) == 0)
+                {
+                    mirrorCd = 0;
+                    string ph; int nud; bool hook;
+                    lock (mlock) { ph = phaseNow; nud = nudgesNow; hook = hookOkNow; }
+                    if (ph != "exiting")
+                        Keeper.SaveStatus(o, new StatusMirror
+                        {
+                            Pid = Environment.ProcessId,
+                            Phase = ph,
+                            Nudges = nud,
+                            HumanHook = hook,
+                            UpdatedAt = DateTimeOffset.Now.ToString("o", CultureInfo.InvariantCulture),
+                        });
+                    // Cleanup may have deleted status.json mid-write: last look, then re-clean.
+                    if (Volatile.Read(ref stopFlag[0]) != 0) Keeper.TryDelete(Keeper.StatusPath(o));
+                }
+                Thread.Sleep(1000);
+            }
+        }) { IsBackground = true, Name = "awake-mailbox" };
+        mboxThread.Start();
+
         if (st.Mode == "dark") EnterDark();
         t.Start();
 
