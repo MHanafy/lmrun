@@ -374,9 +374,11 @@ awake - keep-awake + zero-light dark overlay (files: %LOCALAPPDATA%\Awake\)
         Re-running start while live = EXTEND the window (never re-blanks; pass --dark
         only if you also want to turn the overlay ON on a live keeper).
   stop  cooperative stop: flips the mailbox; the worker exits itself (force-kill after 5 s).
-        The worker also shows a tray icon (status tooltip + Stop + Open log) while running;
-        --no-tray hides it. In dark phase the overlay covers the taskbar - any human input
-        wakes it first, THEN the tray is reachable.
+        The worker also shows a tray icon (status tooltip + Hide + Open log + Stop) while
+        running; --no-tray hides it. 'Hide black screen (keep armed)' appears in the menu
+        ONLY while the overlay is dark: manual dismiss that keeps the keepalive running.
+        In dark phase the overlay covers the taskbar - any human input wakes it first,
+        THEN the tray is reachable.
   status [--json]
   renew-wait --minutes N   sleep (N-5) min then exit - run as agent background job; its
         completion is the agent's renewal alarm. Renew with 'start --minutes N' (NO --dark).
@@ -854,12 +856,12 @@ internal static class Worker
             Cursor.Hide();
             Keeper.Log(o, $"DARK (human idle {HumanIdleLabel()})");
         }
-        void EnterLit()
+        void EnterLit(string why = "human input")
         {
             isDark = false;
             f.Hide();
             Cursor.Show();
-            Keeper.Log(o, "WAKE (human input)");
+            Keeper.Log(o, $"WAKE ({why})");
         }
         string HumanIdleLabel() => hookOk ? $"{(int)Native.Human.IdleSeconds}s" : "hooks-dead";
         string RetireLabel()
@@ -1050,8 +1052,10 @@ internal static class Worker
             {
                 tray = new TrayUi(Keeper.LogPath(o),
                     () => $"awake - {(st.Mode == "dark" ? "dark+keeper" : "keeper")} - {(isDark ? "DARK" : "lit")} - nudge #{nudges} - retires {RetireLabel()}",
+                    () => isDark,
+                    () => { Native.Human.Touch(); if (isDark) EnterLit("HIDE from tray - black screen dismissed by hand, keepalive STAYS ARMED; re-blanks after idle"); },
                     () => Cleanup("stop requested from tray"));
-                tray.Balloon($"Armed ({st.Mode}): F15 keep-awake live, retires {RetireLabel()}. Stop from this menu.");
+                tray.Balloon($"Armed ({st.Mode}): F15 keep-awake live, retires {RetireLabel()}. Hide/Stop from this menu.");
             }
             catch (Exception tx) { Keeper.Log(o, $"tray unavailable: {tx.Message}"); tray = null; }
 
@@ -1061,22 +1065,24 @@ internal static class Worker
     }
 }
 
-// Tray icon for the live worker: at-a-glance status (tooltip + menu header) and a
-// one-click cooperative stop, so the console can stay hidden. Pure notification - it
-// touches NONE of the protection path (heartbeat/hooks/mailbox unchanged); Stop reuses
-// the exact cooperative Cleanup() the CLI mailbox uses. CAVEAT (by design): during the
-// dark phase the overlay covers the taskbar (zero-light doctrine), so the tray is only
-// clickable after human input wakes the overlay - the CLI 'stop' always works. A hard-
-// killed worker's icon ghosts in the tray until hovered - standard Windows behavior.
+// Tray icon for the live worker: at-a-glance status (tooltip + menu header), a manual
+// 'Hide overlay' dismiss (visible ONLY while the black screen is on - the escape hatch for
+// an overlay that refuses to auto-hide; keepalive stays armed) and a one-click cooperative
+// stop, so the console can stay hidden. Pure notification - it touches NONE of the
+// protection path (heartbeat/hooks/mailbox unchanged); Stop reuses the exact cooperative
+// Cleanup() the CLI mailbox uses. CAVEAT (by design): during the dark phase the overlay
+// covers the taskbar (zero-light doctrine), so the tray is only clickable after human
+// input wakes the overlay - the CLI 'stop' always works. A hard-killed worker's icon
+// ghosts in the tray until hovered - standard Windows behavior.
 sealed class TrayUi : IDisposable
 {
     readonly NotifyIcon icon;
-    readonly ToolStripMenuItem header;
+    readonly ToolStripMenuItem header, hideItem;
     readonly ContextMenuStrip menu;
     readonly Icon iconDark, iconLit;
     readonly Func<string> statusText;
 
-    public TrayUi(string logPath, Func<string> statusText, Action stop)
+    public TrayUi(string logPath, Func<string> statusText, Func<bool> overlayOn, Action hide, Action stop)
     {
         this.statusText = statusText;
         iconDark = MakeIcon(filled: true);   // dark phase: filled disc
@@ -1086,9 +1092,12 @@ sealed class TrayUi : IDisposable
         {
             try { Process.Start(new ProcessStartInfo(logPath) { UseShellExecute = true }); } catch { }
         });
+        hideItem = new ToolStripMenuItem("Hide black screen (keep armed)", null, (s, e) => hide());
         var stopItem = new ToolStripMenuItem("Stop awake", null, (s, e) => stop());
         menu = new ContextMenuStrip();
-        menu.Items.AddRange(new ToolStripItem[] { header, new ToolStripSeparator(), openLog, new ToolStripSeparator(), stopItem });
+        menu.Items.AddRange(new ToolStripItem[] { header, new ToolStripSeparator(), openLog, new ToolStripSeparator(), hideItem, stopItem });
+        // the manual dismiss only exists while the black screen is actually on
+        menu.Opening += (s, e) => { try { hideItem.Visible = overlayOn(); } catch { hideItem.Visible = false; } };
         icon = new NotifyIcon { Icon = iconLit, Text = "awake", ContextMenuStrip = menu, Visible = true };
         icon.DoubleClick += (s, e) => Balloon(statusText());
     }
