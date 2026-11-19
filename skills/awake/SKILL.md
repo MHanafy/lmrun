@@ -43,9 +43,12 @@ $dk = "<skill-dir>\app\bin\awake.exe"   # e.g. C:\src\lmrun\skills\awake\app\bin
 & $dk start --minutes 90          # RENEWAL while live = EXTEND (NEVER pass --dark as a renewal)
 & $dk stop                        # cooperative stop via mailbox (force after 5 s); also kills the renewal timer
 & $dk renew-wait --minutes 90     # renewal alarm: sleeps (window-5 min) then exits - run AS an agent background job
-# options: --idle <s> (human idle before re-dark, default 180), --heartbeat <s> (F15 cadence, default 30), --state-dir <path> (alternate instance, for testing),
-#          --no-tray (suppress the worker's tray icon: live status tooltip + "Stop awake" menu + Open log; in the dark phase the
-#          overlay covers the taskbar, so the tray is reachable only after human input wakes - CLI stop always works)
+# options: --idle <s> (human idle before re-dark, default 180, min 15), --heartbeat <s> (F15 cadence, default 30), --state-dir <path> (alternate instance, for testing),
+#          --no-tray (suppress the worker's tray icon: live status tooltip + "Hide black screen (keep armed)" + Open log + "Stop awake" menu;
+#          in the dark phase the overlay covers the taskbar, so the tray is reachable only after human input wakes - CLI stop always works.
+#          "Hide black screen" shows when the menu opens around a dark phase: dismisses the screen FOR GOOD this run - the worker
+#          demotes to keeper (never re-blanks, status reflects it) while keepalive stays armed; re-arm dark via stop + start --dark.
+#          Offer it when the operator wants the black screen gone but the job protected; it is manual (GUI) only - agents keep using CLI stop.)
 # rebuild after source changes:
 #   dotnet publish "<skill-dir>\app\awake.cs" -c Release -o "<skill-dir>\app\bin"
 # (Native AOT deliberately NOT used: WinForms is unsupported by AOT/trimming; self-contained
