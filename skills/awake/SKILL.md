@@ -148,8 +148,18 @@ ambient-light sensor. v6 (2026-11-17) replaced the (ineffective) ES-hold
 protection story with the input keepalive: the worker injects a
 no-op F15 keypress every `--heartbeat` (default 30) s - injected input
 resets Windows' display/sleep idle timers, so blanking and Modern Standby never
-engage; wake/re-blank use low-level hooks that see HUMAN input only (injected
-events are filtered, so the heartbeat never wakes the overlay) PLUS, since 2026-11-18,
+engage; wake/re-blank use low-level hooks that see HUMAN input only - but
+**v6.4.4 CORRECTION (2026-11-23): on THIS Windows the documented
+LLMF_INJECTED filtering does NOT cover our heartbeat** - measured live: the
+injected F15 reaches WH_KEYBOARD_LL with flags=0x10/0x90 and LLMHF_INJECTED
+NOT set, so the pre-v6.4.4 flag filter counted every nudge as human (idle
+capped at HeartbeatSeconds, re-dark unreachable for any --idle >= heartbeat -
+the 'idle never detected' report; hidden pre-v6.4.2 because nothing ever
+landed). The heartbeat now carries a dwExtraInfo signature (NudgeTag
+0x41574B31) and both hooks drop tagged events before the flag check - verified
+against a live hook. Healthy fingerprint: KEEPALIVE lines with `sent=2
+(session idle 0s)` AND `human idle` GROWING +heartbeat s while nobody touches.
+PLUS, since 2026-11-18,
 a raw-input sink (RIDEV_INPUTSINK, HID digitizer page 0x0D usages 0x04/0x05) on the
 overlay's hidden window - LL hooks are blind to TOUCH (its mouse-emulation carries
 LLMHF_INJECTED), so touch/pen wake only works through that sink; the START log line
@@ -242,7 +252,9 @@ timer is an incomplete arm.
   it) and for the pre-v6.4.2 phantom fingerprint (KEEPALIVE lines with
   `session idle` growing +heartbeat s per nudge instead of resetting to 0).
   `ALARM: input-blind hooks` is the separate LL-hook-starvation fingerprint
-  (wakes still work via the session cross-check).
+  (wakes still work via the session cross-check). If `human idle` in KEEPALIVE
+  lines CAPS at ~HeartbeatSeconds while nobody touches the machine, the
+  heartbeat is being counted as human (v6.4.4 class: injection tagging broken).
 - Known root cause on this machine (found 2026-11-09): OEM plans (e.g.
   `PD_Standard`) can carry a hidden per-plan override disabling the **Away Mode
   Policy** (sleep subgroup `238c9fa8-0aad-41ed-83f4-97be242c8f20`, setting

@@ -92,6 +92,14 @@
 //   our overlay and a foreign black layer). (2) The overlay form sets Cursor = Cursors.No:
 //   Cursor.Hide() is only a ref-count hide, and a single cursor sprite glowing on the zero-light
 //   black screen defeats the whole dark-room posture.
+// - v6.4.4 (2026-11-23, operator: 'blackscreen won't engage, idle never detected'): on THIS
+//   Windows the injected F15 reaches WH_KEYBOARD_LL with flags=0x10/0x90 and LLMHF_INJECTED
+//   NOT set - the v6 doctrine 'injected events are filtered so the heartbeat never counts as
+//   human' is FALSE here, so once v6.4.2 made injection real, every nudge stamped the human
+//   idle clock: idle capped at HeartbeatSeconds and re-dark was unreachable for any
+//   --idle >= heartbeat (invisible pre-v6.4.2: nothing ever arrived). Fix: heartbeat events
+//   carry a dwExtraInfo signature (NudgeTag) and both hooks drop tagged events before the
+//   flag check; tagging verified against a live hook (extra read back at KBDLLHOOKSTRUCT+16).
 using System;
 using System.Collections.Concurrent;
 using System.Diagnostics;
@@ -759,19 +767,30 @@ internal static class Native
             GlIdleSeconds() < (Environment.TickCount64 - LastNudgeTicks) / 1000.0 - 2.0;
 
         const uint LLMHF_INJECTED = 0x00000001, LLMHF_LOWER_IL_INJECTED = 0x00000002;
+        // v6.4.4 (2026-11-23): MEASURED on this Windows - our injected F15 reaches the LL hook with
+        // flags=0x10/0x90 and LLMHF_INJECTED NOT set, so the documented filter counted every
+        // heartbeat as HUMAN: the idle clock was re-stamped each nudge (capped at heartbeatSeconds),
+        // making the re-dark threshold unreachable with any --idle >= heartbeat (the 'idle never
+        // detected / blackscreen won't engage' report; it hid in plain sight pre-v6.4.2 because the
+        // broken 32-byte INPUT meant nothing ever arrived). Doctrine fix: the heartbeat carries a
+        // dwExtraInfo signature and the hooks drop tagged events regardless of flags.
+        static readonly IntPtr NudgeTag = new IntPtr(0x41574B31);   // 'AK1'
+        static bool Tagged(IntPtr lParam, int extraOffset) => Marshal.ReadIntPtr(lParam, extraOffset) == NudgeTag;
         static IntPtr kHook = IntPtr.Zero, mHook = IntPtr.Zero;
         static LowLevelProc? kProc, mProc;   // GC roots - never let the delegates die
         static long lastHumanTicks = Environment.TickCount64;
 
         static IntPtr KbHook(int nCode, IntPtr wParam, IntPtr lParam)
         {
-            if (nCode >= 0 && (Marshal.ReadInt32(lParam, 8) & (int)(LLMHF_INJECTED | LLMHF_LOWER_IL_INJECTED)) == 0)
+            // KBDLLHOOKSTRUCT: vkCode 0, scanCode 4, flags 8, time 12, dwExtraInfo 16.
+            if (nCode >= 0 && !Tagged(lParam, 16) && (Marshal.ReadInt32(lParam, 8) & (int)(LLMHF_INJECTED | LLMHF_LOWER_IL_INJECTED)) == 0)
                 lastHumanTicks = Environment.TickCount64;
             return CallNextHookEx(kHook, nCode, wParam, lParam);
         }
         static IntPtr MsHook(int nCode, IntPtr wParam, IntPtr lParam)
         {
-            if (nCode >= 0 && (Marshal.ReadInt32(lParam, 12) & (int)(LLMHF_INJECTED | LLMHF_LOWER_IL_INJECTED)) == 0)
+            // MSLLHOOKSTRUCT: pt.x 0, pt.y 4, mouseData 8, flags 12, time 16, dwExtraInfo 24.
+            if (nCode >= 0 && !Tagged(lParam, 24) && (Marshal.ReadInt32(lParam, 12) & (int)(LLMHF_INJECTED | LLMHF_LOWER_IL_INJECTED)) == 0)
                 lastHumanTicks = Environment.TickCount64;
             return CallNextHookEx(mHook, nCode, wParam, lParam);
         }
@@ -813,8 +832,8 @@ internal static class Native
         public static (uint sent, int err) Nudge()
         {
             INPUT[] a = new INPUT[2];
-            a[0].type = INPUT_KEYBOARD; a[0].u.ki.wVk = VK_F15;
-            a[1].type = INPUT_KEYBOARD; a[1].u.ki.wVk = VK_F15; a[1].u.ki.dwFlags = KEYEVENTF_KEYUP;
+            a[0].type = INPUT_KEYBOARD; a[0].u.ki.wVk = VK_F15; a[0].u.ki.dwExtraInfo = NudgeTag;
+            a[1].type = INPUT_KEYBOARD; a[1].u.ki.wVk = VK_F15; a[1].u.ki.dwFlags = KEYEVENTF_KEYUP; a[1].u.ki.dwExtraInfo = NudgeTag;
             uint r = SendInput((uint)a.Length, a, Marshal.SizeOf(typeof(INPUT)));
             int err = Marshal.GetLastWin32Error();
             // our own injection advances the session clock; stamp it so HumanBySession only
@@ -1084,7 +1103,7 @@ internal static class Worker
         st.HumanHook = hookOk;
         bool touchOk = Native.Human.InstallTouchSink(_handle);
         if (!Keeper.Save(o, st)) { Keeper.Log(o, "RUN aborted: could not claim the control file (busy)"); Keeper.Flush(); return 1; }
-        Keeper.Log(o, $"START cs v6.4.3: {(o.Dark ? "pixel dark + " : "keeper, ")}LIFETIME F15 keepalive every {o.Heartbeat}s (human hook={hookOk}, touch sink={touchOk}, session cross-check + bg mailbox on, sizeof(INPUT)={Native.Human.InputSize})");
+        Keeper.Log(o, $"START cs v6.4.4: {(o.Dark ? "pixel dark + " : "keeper, ")}LIFETIME F15 keepalive every {o.Heartbeat}s (human hook={hookOk}, touch sink={touchOk}, session cross-check + bg mailbox + tagged heartbeat on, sizeof(INPUT)={Native.Human.InputSize})");
         if (!hookOk) Keeper.Log(o, "WARNING: human-input hooks NOT installed - wakes rely on session-input cross-check");
         if (!touchOk) Keeper.Log(o, "WARNING: touch sink NOT registered - touch will NOT wake the overlay");
 
