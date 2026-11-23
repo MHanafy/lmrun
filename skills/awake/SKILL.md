@@ -15,12 +15,29 @@ do not stop Modern-Standby entry, and the only flag that would
 (ES_DISPLAY_REQUIRED) is rejected here (err 87 - display power is OS-owned).
 The real mechanism since v6: the worker injects a no-op F15 keypress every
 HeartbeatSeconds. Injected input resets the system idle timers, so
-the display never blanks and Modern Standby never engages - `status` showing
-RUNNING (and a growing KEEPALIVE count in awake.log) is
-the proof of protection, verified by the ABSENCE of Kernel-Power 506 events.
+the display never blanks and Modern Standby never engages. Proof of protection
+(since v6.4.2, see CORRECTION below): `status` RUNNING **and** fresh
+`KEEPALIVE #n ... sent=2` lines with `session idle 0s` in awake.log. A growing
+KEEPALIVE count alone is NOT proof - pre-v6.4.2 builds logged phantom nudges.
 Since v6.1 / awake (2026-11-17) the heartbeat runs for the WHOLE process
 lifetime, not only while dark - closing the Active-phase race where the DC
-blank timeout (180 s) could beat the first dark-phase nudge. The PowerToys
+blank timeout (180 s) could beat the first dark-phase nudge.
+**v6.4.2 CORRECTION (2026-11-23): the C# worker's heartbeat silently NEVER
+RAN until this version.** The INPUT union declared only KEYBDINPUT (24 B), so
+Marshal.SizeOf(INPUT) was 32 instead of the x64-required 40 (union must size to
+MOUSEINPUT) and every SendInput died with err 87 ERROR_INVALID_PARAMETER - the
+return value was unchecked, so KEEPALIVE log lines claimed injections that never
+happened (forensic fingerprint: worker-side `session idle` grows exactly
++HeartbeatSeconds per KEEPALIVE; a real nudge resets it to 0). During that era
+the box survived dark runs on the ES sys+away hold + the unattended-sleep-timeout
+fix while the OS blanked the display at its own timeout (AC 300 s / DC 180 s) and
+OEM layers (AMD power policy, AsusOLEDShifter - the box runs it) took over the
+screen under the overlay: this is the confirmed root cause of the operator's
+"stuck black screen, clicking/keys ignored until tray stop" reports. Fix: union
+carries MOUSEINPUT (START line now logs sizeof(INPUT)=40) and the heartbeat
+CHECKS SendInput - failures log 'ALARM: F15 injection FAILED' once a minute.
+Proof of protection is a KEEPALIVE line containing `sent=2` with `session idle 0s`.
+The PowerToys
 Awake dependency is RETIRED (its ES hold was measured inert against idle
 standby here; the "keeper" mode of awake IS the keep-awake) - the legacy
 PowerToys-based ps1 scripts remain in the folder as fallback until deleted.
@@ -213,10 +230,16 @@ timer is an incomplete arm.
 - If a job is still suspending while armed, do not escalate settings; check
   for Kernel-Power event id 506 after the screen blanked AND cross-check
   the journal (`%LOCALAPPDATA%\Awake\awake.log`; `darkscreen.log` for
-  legacy ps1 runs): the worker logs `KEEPALIVE #n` every nudge - a gap
-  between the last KEEPALIVE and the 506 means the process (not the mechanism)
-  died at that moment; find out what killed it. A 506 while KEEPALIVE lines
-  keep streaming would mean the keepalive itself stopped working - report it.
+  legacy ps1 runs): the worker logs `KEEPALIVE #n ... sent=2` every landed
+  nudge - a gap between the last KEEPALIVE and the 506 means the process (not
+  the mechanism) died at that moment; find out what killed it. A 506 while
+  KEEPALIVE lines keep streaming means the MECHANISM stopped working: look for
+  `ALARM: F15 injection FAILED sent=... err=...` (v6.4.2: injection rejected
+  by the OS while the worker lives - protection is only the ES hold, report
+  it) and for the pre-v6.4.2 phantom fingerprint (KEEPALIVE lines with
+  `session idle` growing +heartbeat s per nudge instead of resetting to 0).
+  `ALARM: input-blind hooks` is the separate LL-hook-starvation fingerprint
+  (wakes still work via the session cross-check).
 - Known root cause on this machine (found 2026-11-09): OEM plans (e.g.
   `PD_Standard`) can carry a hidden per-plan override disabling the **Away Mode
   Policy** (sleep subgroup `238c9fa8-0aad-41ed-83f4-97be242c8f20`, setting

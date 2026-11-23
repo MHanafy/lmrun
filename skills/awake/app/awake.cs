@@ -70,6 +70,21 @@
 //   mailbox writes of mode=dark are ignored (logged) until the run is stopped and re-armed.
 //   The worker's authoritative mode rides the status.json mirror so 'status' reports the
 //   truth after a hide, and every dismiss is greppable as 'WAKE (HIDE from tray ...)'.
+// - v6.4.2 (2026-11-23, operator: 'stuck black screen, clicking/keys ignored until tray stop'):
+//   THE HEARTBEAT NEVER LANDED. The INPUT union declared only KEYBDINPUT (24 B), so
+//   Marshal.SizeOf(INPUT) was 32 instead of the x64-required 40 (union must size to MOUSEINPUT)
+//   and SendInput rejected EVERY event: return 0, err 87 ERROR_INVALID_PARAMETER. The return
+//   value was unchecked, so KEEPALIVE lines claimed injections that never happened (forensic:
+//   worker-side session idle grows exactly +30 s per heartbeat, our own F15 never resets it,
+//   and a live A/B test: 32-byte INPUT -> ret 0/err 87, 40-byte -> ret 2/gllIdle=0). Consequence:
+//   the OS blanked the display freely during runs (AC 300 s / DC 180 s) and the AMD/OEM layers
+//   (power policy, AsusOLEDShifter - the box runs it) took over the screen under our overlay -
+//   exactly the 'certain scenarios' where the screen stuck black while awake reported RUNNING.
+//   Survival through dark runs was the ES sys+away hold + the unattended-sleep-timeout=0 fix,
+//   NOT the keepalive. Fixes: union now carries MOUSEINPUT (sizeof(INPUT)=40, measured), and
+//   the heartbeat CHECKS SendInput - failures log 'ALARM: F15 injection FAILED' once a minute
+//   and a recovery line when it lands again. NEVER trust a KEEPALIVE line again without
+//   'sent=2' being structurally possible.
 using System;
 using System.Collections.Concurrent;
 using System.Diagnostics;
@@ -774,20 +789,28 @@ internal static class Native
         public static double IdleSeconds => (Environment.TickCount64 - lastHumanTicks) / 1000.0;
 
         [StructLayout(LayoutKind.Sequential)] struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
-        [StructLayout(LayoutKind.Explicit)] struct INPUTUNION { [FieldOffset(0)] public KEYBDINPUT ki; }
+        // v6.4.2 CRITICAL: the union MUST also carry MOUSEINPUT (32 B) - Windows validates
+        // cbSize against the REAL sizeof(INPUT) = 40 on x64. Declaring only KEYBDINPUT made it
+        // 32 and every SendInput died with err 87: the keepalive silently never ran (2026-11-23).
+        [StructLayout(LayoutKind.Sequential)] struct MOUSEINPUT { public int dx; public int dy; public uint mouseData; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
+        [StructLayout(LayoutKind.Explicit)] struct INPUTUNION { [FieldOffset(0)] public KEYBDINPUT ki; [FieldOffset(0)] public MOUSEINPUT mi; }
         [StructLayout(LayoutKind.Sequential)] struct INPUT { public uint type; public INPUTUNION u; }
+        public static int InputSize => Marshal.SizeOf(typeof(INPUT));   // must be 40 on x64 (v6.4.2)
         const uint INPUT_KEYBOARD = 1, KEYEVENTF_KEYUP = 2;
         const ushort VK_F15 = 0x7C;   // effectively unbound everywhere; a true no-op
 
-        public static void Nudge()
+        // Returns (eventsAccepted, lastError) so the caller can NEVER log a phantom KEEPALIVE.
+        public static (uint sent, int err) Nudge()
         {
             INPUT[] a = new INPUT[2];
             a[0].type = INPUT_KEYBOARD; a[0].u.ki.wVk = VK_F15;
             a[1].type = INPUT_KEYBOARD; a[1].u.ki.wVk = VK_F15; a[1].u.ki.dwFlags = KEYEVENTF_KEYUP;
-            SendInput((uint)a.Length, a, Marshal.SizeOf(typeof(INPUT)));
+            uint r = SendInput((uint)a.Length, a, Marshal.SizeOf(typeof(INPUT)));
+            int err = Marshal.GetLastWin32Error();
             // our own injection advances the session clock; stamp it so HumanBySession only
             // reports input that arrived AFTER this heartbeat (i.e. a real human).
             LastNudgeTicks = Environment.TickCount64;
+            return (r, err);
         }
     }
 }
@@ -855,6 +878,7 @@ internal static class Worker
         // EnterLit only fires during dark phases).
         long lastDarkEnd = 0;
         int tick = 0, nudges = 0;
+        int lastInjectAlarm = -999; bool injectFailing = false;   // v6.4.2 injection honesty
         long lastSeq = -1;
         TrayUi? tray = null;
 
@@ -977,11 +1001,27 @@ internal static class Worker
             }
 
             // v6.1: LIFETIME heartbeat - protection is decoupled from the dark/active cycle
+            // v6.4.2: the SendInput result is CHECKED - a KEEPALIVE line now proves injection.
             if (st.HeartbeatSeconds > 0 && tick % st.HeartbeatSeconds == 0)
             {
-                Native.Human.Nudge();
-                nudges++;
-                Keeper.Log(o, $"KEEPALIVE #{nudges} F15 injected (human idle {HumanIdleLabel()}, session idle {Native.Human.GlIdleSeconds():n0}s, phase {(isDark ? "dark" : "lit")})");
+                var (sent, serr) = Native.Human.Nudge();
+                if (sent == 2)
+                {
+                    nudges++;
+                    if (injectFailing) { Keeper.Log(o, "F15 injection RECOVERED"); injectFailing = false; }
+                    Keeper.Log(o, $"KEEPALIVE #{nudges} F15 injected sent={sent} (human idle {HumanIdleLabel()}, session idle {Native.Human.GlIdleSeconds():n0}s, phase {(isDark ? "dark" : "lit")})");
+                }
+                else
+                {
+                    // keepalive NOT landing = protection GONE while the worker lives (the exact
+                    // v6.0-v6.4.1 silent failure). Alarm loudly, once a minute, and in status.
+                    injectFailing = true;
+                    if (tick - lastInjectAlarm > 60)
+                    {
+                        lastInjectAlarm = tick;
+                        Keeper.Log(o, $"ALARM: F15 injection FAILED sent={sent} err={serr} - KEEPALIVE NOT LANDING, protection relies only on the ES hold - the display WILL blank at the OS timeout");
+                    }
+                }
             }
 
             // v6.4 RECOVERY: the win32k session clock saw a human but our hook clock missed them
@@ -1033,7 +1073,7 @@ internal static class Worker
         st.HumanHook = hookOk;
         bool touchOk = Native.Human.InstallTouchSink(_handle);
         if (!Keeper.Save(o, st)) { Keeper.Log(o, "RUN aborted: could not claim the control file (busy)"); Keeper.Flush(); return 1; }
-        Keeper.Log(o, $"START cs v6.4.1: {(o.Dark ? "pixel dark + " : "keeper, ")}LIFETIME F15 keepalive every {o.Heartbeat}s (human hook={hookOk}, touch sink={touchOk}, session cross-check + bg mailbox on)");
+        Keeper.Log(o, $"START cs v6.4.2: {(o.Dark ? "pixel dark + " : "keeper, ")}LIFETIME F15 keepalive every {o.Heartbeat}s (human hook={hookOk}, touch sink={touchOk}, session cross-check + bg mailbox on, sizeof(INPUT)={Native.Human.InputSize})");
         if (!hookOk) Keeper.Log(o, "WARNING: human-input hooks NOT installed - wakes rely on session-input cross-check");
         if (!touchOk) Keeper.Log(o, "WARNING: touch sink NOT registered - touch will NOT wake the overlay");
 
