@@ -85,6 +85,13 @@
 //   the heartbeat CHECKS SendInput - failures log 'ALARM: F15 injection FAILED' once a minute
 //   and a recovery line when it lands again. NEVER trust a KEEPALIVE line again without
 //   'sent=2' being structurally possible.
+// - v6.4.3 (2026-11-23, operator requests): (1) tray 'Hide black screen' is ALWAYS visible -
+//   clicking it while the worker believes the phase is LIT is treated as a STUCK-SCREEN REPORT
+//   and logs 'HIDE-forensics' (both idle clocks, hook/touch state, overlay Visible flag, and
+//   whether AsusOLEDShifter - the OEM OLED screen-saver - is running: blame attribution between
+//   our overlay and a foreign black layer). (2) The overlay form sets Cursor = Cursors.No:
+//   Cursor.Hide() is only a ref-count hide, and a single cursor sprite glowing on the zero-light
+//   black screen defeats the whole dark-room posture.
 using System;
 using System.Collections.Concurrent;
 using System.Diagnostics;
@@ -401,10 +408,13 @@ awake - keep-awake + zero-light dark overlay (files: %LOCALAPPDATA%\Awake\)
         only if you also want to turn the overlay ON on a live keeper).
   stop  cooperative stop: flips the mailbox; the worker exits itself (force-kill after 5 s).
         The worker also shows a tray icon (status tooltip + Hide + Open log + Stop) while
-        running; --no-tray hides it. 'Hide black screen (keep armed)' appears in the menu
-        only around a dark phase: dismisses the black screen for good this run (the
+        running; --no-tray hides it. 'Hide black screen (keep armed)' is ALWAYS in the menu
+        (v6.4.3): dismisses the black screen for good this run (the
         worker demotes to keeper, never re-blanks) while the keepalive stays armed.
-        Re-arm dark with: stop, then start --dark.
+        Re-arm dark with: stop, then start --dark. Clicking it while the worker believes
+        the screen is LIT is a stuck-black-screen report: it logs a full 'HIDE-forensics'
+        dump (idle clocks, hook/touch state, overlay Visible, AsusOLEDShifter presence)
+        so the black layer can be attributed afterwards.
         In dark phase the overlay covers the taskbar - any human input wakes it first,
         THEN the tray is reachable.
   status [--json]
@@ -827,6 +837,10 @@ sealed class Overlay : Form
         TopMost = true;
         ShowInTaskbar = false;
         AutoScaleMode = AutoScaleMode.None;
+        // v6.4.3: the dark phase must emit ZERO light - Cursor.Hide() alone is only a
+        // ref-count hide; a cursor sprite could still be painted while over the overlay.
+        // Cursors.No makes Windows paint no sprite anywhere the (full-screen) form hits.
+        Cursor = Cursors.No;
     }
     // any WM_INPUT from the registered digitizer devices = a human touched the screen
     protected override void WndProc(ref Message m)
@@ -871,11 +885,8 @@ internal static class Worker
         // the worker demotes itself to keeper (never re-blanks) and a later CLI extend writing
         // mode=dark into the mailbox must NOT re-arm the dark phase (stop + start --dark to re-arm).
         bool hidden = false;
-        // Opening the tray menu is itself a human input, so the overlay usually wakes a beat
-        // BEFORE the menu paints and a strict 'isDark now' check would hide 'Hide' at the exact
-        // moment it is needed. Grace: the item also shows within 5 s of leaving the dark phase
-        // (still dark from the user's point of view; keeper-only runs never retrigger it because
-        // EnterLit only fires during dark phases).
+        // (v6.4.3: the item is ALWAYS visible now - an operator facing a black screen must always
+        // reach the escape hatch; lastDarkEnd survives purely for the stuck-screen forensics line.)
         long lastDarkEnd = 0;
         int tick = 0, nudges = 0;
         int lastInjectAlarm = -999; bool injectFailing = false;   // v6.4.2 injection honesty
@@ -1073,7 +1084,7 @@ internal static class Worker
         st.HumanHook = hookOk;
         bool touchOk = Native.Human.InstallTouchSink(_handle);
         if (!Keeper.Save(o, st)) { Keeper.Log(o, "RUN aborted: could not claim the control file (busy)"); Keeper.Flush(); return 1; }
-        Keeper.Log(o, $"START cs v6.4.2: {(o.Dark ? "pixel dark + " : "keeper, ")}LIFETIME F15 keepalive every {o.Heartbeat}s (human hook={hookOk}, touch sink={touchOk}, session cross-check + bg mailbox on, sizeof(INPUT)={Native.Human.InputSize})");
+        Keeper.Log(o, $"START cs v6.4.3: {(o.Dark ? "pixel dark + " : "keeper, ")}LIFETIME F15 keepalive every {o.Heartbeat}s (human hook={hookOk}, touch sink={touchOk}, session cross-check + bg mailbox on, sizeof(INPUT)={Native.Human.InputSize})");
         if (!hookOk) Keeper.Log(o, "WARNING: human-input hooks NOT installed - wakes rely on session-input cross-check");
         if (!touchOk) Keeper.Log(o, "WARNING: touch sink NOT registered - touch will NOT wake the overlay");
 
@@ -1126,8 +1137,33 @@ internal static class Worker
             {
                 tray = new TrayUi(Keeper.LogPath(o),
                     () => $"awake - {(st.Mode == "dark" ? "dark+keeper" : "keeper")} - {(isDark ? "DARK" : "lit")} - nudge #{nudges} - retires {RetireLabel()}",
-                    () => isDark || (Environment.TickCount64 - lastDarkEnd) < 5000,
-                    () => { if (hidden) return; hidden = true; st.Mode = "keeper"; EnterLit("HIDE from tray - black screen dismissed by hand; keepalive STAYS ARMED, no more darkening this run"); tray?.Update(false); },
+                    () =>
+                    {
+                        if (hidden) return;
+                        bool believedDark = isDark;   // the worker's truth at the moment of the click
+                        hidden = true; st.Mode = "keeper";
+                        if (believedDark)
+                        {
+                            EnterLit("HIDE from tray - black screen dismissed by hand; keepalive STAYS ARMED, no more darkening this run");
+                        }
+                        else
+                        {
+                            // v6.4.3 STUCK-SCREEN REPORT: the operator pressed 'Hide black screen' while
+                            // we believe the screen is LIT. Either our Show/Hide desynced from reality,
+                            // or a foreign black layer (OS blank / AMD power policy / AsusOLEDShifter) is
+                            // on top of a released overlay. Dump everything that can attribute blame.
+                            EnterLit("HIDE from tray WHILE WE BELIEVED LIT - operator saw a black screen our phase does not explain");
+                            Keeper.Log(o, $"HIDE-forensics: believed phase=lit at click (operator saw black); hookIdle={(hookOk ? (int)Native.Human.IdleSeconds : -1)}s sessionIdle={Native.Human.GlIdleSeconds():n0}s hookOk={hookOk} touchSink={touchOk} nudges={nudges} sizeofINPUT={Native.Human.InputSize} sinceLastDarkEnd={(Environment.TickCount64 - lastDarkEnd) / 1000.0:n0}s overlayVisible={f.Visible}");
+                            try
+                            {
+                                var shifter = Process.GetProcessesByName("AsusOLEDShifter");
+                                Keeper.Log(o, $"HIDE-forensics: AsusOLEDShifter pids={(shifter.Length > 0 ? string.Join(",", shifter.Select(p => p.Id)) : "NONE")} - if present, the black layer may be the OEM OLED screen-saver, not our overlay");
+                                foreach (var p in shifter) p.Dispose();
+                            }
+                            catch (Exception fx) { Keeper.Log(o, $"HIDE-forensics: OEM-layer probe failed: {fx.Message}"); }
+                        }
+                        tray?.Update(false);
+                    },
                     () => Cleanup("stop requested from tray"));
                 tray.Balloon($"Armed ({st.Mode}): F15 keep-awake live, retires {RetireLabel()}. Hide/Stop from this menu.");
             }
@@ -1140,16 +1176,16 @@ internal static class Worker
 }
 
 // Tray icon for the live worker: at-a-glance status (tooltip + menu header), a manual
-// 'Hide overlay' dismiss (visible ONLY while the black screen is on - the escape hatch for
-// an overlay that refuses to auto-hide: it demotes this run to keeper so it never
-// re-blanks, while keepalive stays armed) and a one-click cooperative stop, so the
-// console can stay hidden. The dismiss is operator authority: the worker then IGNORES
-// mailbox attempts to re-enter dark (see 'hidden' in Worker.Run). It touches NONE of the
-// protection path (heartbeat/hooks/mailbox unchanged); Stop reuses the exact cooperative
-// Cleanup() the CLI mailbox uses. CAVEAT (by design): during the dark phase the overlay
-// covers the taskbar (zero-light doctrine), so the tray is only clickable after human
-// input wakes the overlay - the CLI 'stop' always works. A hard-killed worker's icon
-// ghosts in the tray until hovered - standard Windows behavior.
+// 'Hide black screen' dismiss (ALWAYS visible since v6.4.3: an operator who sees a black
+// screen must always reach the escape hatch from here, even in a phase we believe is lit -
+// clicking it while we believe 'lit' is a STUCK-SCREEN REPORT and logs a full forensic dump),
+// and a one-click cooperative stop, so the console can stay hidden. The dismiss is operator
+// authority: the worker then IGNORES mailbox attempts to re-enter dark (see 'hidden' in
+// Worker.Run). It touches NONE of the protection path (heartbeat/hooks/mailbox unchanged);
+// Stop reuses the exact cooperative Cleanup() the CLI mailbox uses. CAVEAT (by design):
+// during the dark phase the overlay covers the taskbar (zero-light doctrine), so the tray is
+// only clickable after human input wakes the overlay - the CLI 'stop' always works. A
+// hard-killed worker's icon ghosts in the tray until hovered - standard Windows behavior.
 sealed class TrayUi : IDisposable
 {
     readonly NotifyIcon icon;
@@ -1158,7 +1194,7 @@ sealed class TrayUi : IDisposable
     readonly Icon iconDark, iconLit;
     readonly Func<string> statusText;
 
-    public TrayUi(string logPath, Func<string> statusText, Func<bool> overlayOn, Action hide, Action stop)
+    public TrayUi(string logPath, Func<string> statusText, Action hide, Action stop)
     {
         this.statusText = statusText;
         iconDark = MakeIcon(filled: true);   // dark phase: filled disc
@@ -1172,8 +1208,6 @@ sealed class TrayUi : IDisposable
         var stopItem = new ToolStripMenuItem("Stop awake", null, (s, e) => stop());
         menu = new ContextMenuStrip();
         menu.Items.AddRange(new ToolStripItem[] { header, new ToolStripSeparator(), openLog, new ToolStripSeparator(), hideItem, stopItem });
-        // the manual dismiss only exists while the black screen is actually on
-        menu.Opening += (s, e) => { try { hideItem.Visible = overlayOn(); } catch { hideItem.Visible = false; } };
         icon = new NotifyIcon { Icon = iconLit, Text = "awake", ContextMenuStrip = menu, Visible = true };
         icon.DoubleClick += (s, e) => Balloon(statusText());
     }

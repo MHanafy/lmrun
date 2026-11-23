@@ -63,9 +63,12 @@ $dk = "<skill-dir>\app\bin\awake.exe"   # e.g. C:\src\lmrun\skills\awake\app\bin
 # options: --idle <s> (human idle before re-dark, default 180, min 15), --heartbeat <s> (F15 cadence, default 30), --state-dir <path> (alternate instance, for testing),
 #          --no-tray (suppress the worker's tray icon: live status tooltip + "Hide black screen (keep armed)" + Open log + "Stop awake" menu;
 #          in the dark phase the overlay covers the taskbar, so the tray is reachable only after human input wakes - CLI stop always works.
-#          "Hide black screen" shows when the menu opens around a dark phase: dismisses the screen FOR GOOD this run - the worker
+#          "Hide black screen" is ALWAYS in the menu (v6.4.3): dismisses the screen FOR GOOD this run - the worker
 #          demotes to keeper (never re-blanks, status reflects it) while keepalive stays armed; re-arm dark via stop + start --dark.
-#          Offer it when the operator wants the black screen gone but the job protected; it is manual (GUI) only - agents keep using CLI stop.)
+#          Clicking it while the worker believes the phase is LIT counts as a STUCK-BLACK-SCREEN REPORT: it logs a
+#          'HIDE-forensics' line (both idle clocks, hook/touch state, overlay Visible flag, AsusOLEDShifter pids) so the
+#          black layer can later be attributed to our overlay vs an OS/OEM layer. The dark overlay also sets the form
+#          cursor to None (v6.4.3): zero light includes the cursor sprite itself.)
 # rebuild after source changes:
 #   dotnet publish "<skill-dir>\app\awake.cs" -c Release -o "<skill-dir>\app\bin"
 # (Native AOT deliberately NOT used: WinForms is unsupported by AOT/trimming; self-contained
