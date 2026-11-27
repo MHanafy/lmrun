@@ -206,6 +206,30 @@ v7 changes beyond the target design, per operator (decisions recorded 2026-11-27
   and `WAKE (<reason>)`; tick body can never throw (two guarded sections; mailbox failure
   skips only mailbox handling - enforced and test-proven).
 
+v7 POST-BUILD ACCEPTANCE vs the FINISHED worker (16:47:54-16:57:28): PASS
+
+- Elevated `powercfg /requests` (16:48:22, worker pid 33252, dark):
+  `\Device\HarddiskVolume3\src\lmrun\skills\awake\app\bin\awake.exe` listed under BOTH
+  DISPLAY and SYSTEM - the CLI-spawned worker holds the real display request (0A-2').
+- Journal: `HOLD armed (AC): cont|sys|disp -> prev=0x80000000 HELD`, `DARK (human idle 1s)`,
+  `WAKE (mouse move)`, `DARK (human idle 15s)` at 16:48:36, then ONE continuous dark
+  phase until `WAKE (shutdown)` at 16:56:50 = 8 min 14 s untouched with the AC blank
+  timeout armed at 60 s (~8x the timeout, no blank; complements the 14-min harness hold
+  0A-3 above). ZERO Kernel-Power 506/507/566 events between worker start (16:47:54) and
+  stop - the 16:46:55/16:47:35 events predate the arm (baseline noise, 0A-1 rates).
+  Heartbeat-probe sampler (no ES hold, observes only): 53 samples, max gap 11 s - no
+  freeze episode (0A-3').
+- Dark-vs-lit parity on the worker (0A-5'): `--dark --idle 15`, transcribed BLACK under
+  the overlay: 14/11/10 s per chunk; keeper-lit same worker: 11/10/10 s; identical 1089
+  chars each run. First clip 14 s = model cold start (same pattern as the harness A/B/A).
+  Overlay visibility costs the GPU nothing measurable (0A-5' == 0A-5 conclusion).
+- Both runs ended `EXIT: stop requested via mailbox` (clean), files removed. Caveat: the
+  untouched window was 8 min, not the planned 10 - the restore UAC prompt was cancelled
+  and the script aborted early; the full-length proof stands from harness 0A-3. The
+  60 s timeout needed THREE more UAC re-issues to restore (operator away); VIDEOIDLE AC
+  verified back at 0x12c (300 s) at end of session. Lesson for future test scripts:
+  restore the timeout FIRST after the capture, not at the end of a long sleep.
+
 SELFTEST OUTPUT (published build, `%TEMP%\opencode\awake-selftest`, 2026-11-27):
 
     PASS  dark: overlay visible right after arm
