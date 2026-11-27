@@ -40,8 +40,12 @@ using System.Windows.Forms;
 
 internal static class Probe
 {
-    const uint ES_CONTINUOUS = 0x80000000, ES_SYSTEM_REQUIRED = 0x00000002,
-               ES_DISPLAY_REQUIRED = 0x00000004, ES_AWAYMODE_REQUIRED = 0x00000040;
+    // CANONICAL winbase.h values. The whole ps1->C# awake lineage used 0x2/"sys" and
+    // 0x4/"disp" - wrong: 0x2 IS display and 0x4 is ES_USER_PRESENT (unsupported: any
+    // combination fails with err 87, by design). That off-by-one IS the err-87 "premise".
+    const uint ES_CONTINUOUS = 0x80000000, ES_SYSTEM_REQUIRED = 0x00000001,
+               ES_DISPLAY_REQUIRED = 0x00000002, ES_USER_PRESENT = 0x00000004,
+               ES_AWAYMODE_REQUIRED = 0x00000040;
 
     [DllImport("kernel32.dll", SetLastError = true)] static extern uint SetThreadExecutionState(uint f);
     [StructLayout(LayoutKind.Sequential)] struct LASTINPUTINFO { public uint cbSize; public uint dwTime; }
@@ -88,16 +92,21 @@ internal static class Probe
         Console.WriteLine($"[{Now}] sizeof(uint) flags: sys=0x{ES_SYSTEM_REQUIRED:X} disp=0x{ES_DISPLAY_REQUIRED:X} away=0x{ES_AWAYMODE_REQUIRED:X} cont=0x{ES_CONTINUOUS:X8}");
         (uint flags, string name)[] attempts =
         {
-            (ES_CONTINUOUS | ES_SYSTEM_REQUIRED, "cont|sys"),
-            (ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED, "cont|sys|disp"),           // THE premise check (err 87 claim)
-            (ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED | ES_AWAYMODE_REQUIRED, "cont|sys|disp|away"),
-            (ES_CONTINUOUS | ES_DISPLAY_REQUIRED, "cont|disp"),                                     // full rejection matrix before blocker
-            (ES_DISPLAY_REQUIRED, "disp (non-continuous)"),
-            (ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_AWAYMODE_REQUIRED, "cont|sys|away"),           // known-good reference (v6 fallback)
+            (ES_CONTINUOUS | ES_SYSTEM_REQUIRED, "cont|sys (0x..01)"),
+            (ES_CONTINUOUS | ES_DISPLAY_REQUIRED, "cont|disp (0x..02)"),
+            (ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED, "cont|sys|disp (0x..03) = THE rebuild request"),
+            (ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED | ES_AWAYMODE_REQUIRED, "cont|sys|disp|away (0x..43)"),
+            (ES_DISPLAY_REQUIRED, "disp non-continuous (0x..02)"),
+            (ES_CONTINUOUS | ES_USER_PRESENT, "cont|user-present (0x..04) - docs: must FAIL 87"),
+            (ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED, "redo 0x..03"),
+            // legacy lineage values under the CORRECT decoding, to close the old misdiagnosis:
+            (0x80000006, "v6 called this sys|disp, actually disp|USER_PRESENT - expect 87"),
+            (0x80000042, "v6 held this as sys|away, actually disp|away - expect ACCEPTED"),
             (ES_CONTINUOUS, "cont (clear)"),
         };
         foreach (var (flags, name) in attempts)
         {
+            SetThreadExecutionState(ES_CONTINUOUS);   // clean slate so prev-state reads are unambiguous
             uint r = SetThreadExecutionState(flags);
             int err = Marshal.GetLastWin32Error();
             // RETURN VALUE = PREVIOUS state; 0 = the call FAILED.

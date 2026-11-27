@@ -3,7 +3,7 @@
 Human-facing documentation. NOT agent instructions. Written 2026-11-09 after the
 original keep-awake investigation; read this when tuning the skill itself.
 
-## 2026-11-27: Step-0 verification of the "display-on request" rebuild - BLOCKED at 0A-1
+## 2026-11-27: Step-0 verification of the "display-on request" rebuild - PASSES (0A-1 premise was a wrong-constants bug)
 
 Plan under test (operator task): drop the F15 injection machinery and instead hold
 `SetThreadExecutionState(ES_CONTINUOUS|ES_SYSTEM_REQUIRED|ES_DISPLAY_REQUIRED)` for the
@@ -14,30 +14,53 @@ hex-literal bug above cannot contaminate these results. Worker verified OFF befo
 testing (`status` -> OFF, no keeper.json). On AC (Win32_Battery status=2), lid open,
 `AsusOLEDShifter` pid 14764 running (Armoury Crate not running).
 
-### 0A-1 (BLOCKER): FAIL - ES_DISPLAY_REQUIRED is rejected on this box, every variant
+### 0A-1 (BLOCKER?): the err-87 "premise" is a WRONG-CONSTANTS bug in the whole awake lineage
 
-Full rejection matrix, 2026-11-27 14:31:49 + 14:32:19 (return value = PREVIOUS state,
-0 = rejected; lasterr via GetLastError after rejection):
+First matrix (14:31:49, harness initially copying awake.cs's constants sys=0x2/disp=0x4):
+every "display" combo rejected err 87 -> recorded as a blocker. Then a deeper probe
+(operator-requested) against Microsoft Learn / winbase.h found the lineage bug:
 
-    SetThreadExecutionState(cont|sys            = 0x80000002) -> ret=0x80000000 ACCEPTED lasterr=0
-    SetThreadExecutionState(cont|sys|disp       = 0x80000006) -> ret=0x00000000 REJECTED lasterr=87
-    SetThreadExecutionState(cont|sys|disp|away  = 0x80000046) -> ret=0x00000000 REJECTED lasterr=87
-    SetThreadExecutionState(cont|disp           = 0x80000004) -> ret=0x00000000 REJECTED lasterr=87
-    SetThreadExecutionState(disp non-continuous = 0x00000004) -> ret=0x00000000 REJECTED lasterr=87
-    SetThreadExecutionState(cont|sys|away       = 0x80000042) -> ret=0x80000002 ACCEPTED lasterr=0
-    SetThreadExecutionState(cont clear)                       -> ret=0x80000042 ACCEPTED lasterr=0
+    CANONICAL: ES_CONTINUOUS=0x80000000  ES_SYSTEM_REQUIRED=0x1  ES_DISPLAY_REQUIRED=0x2
+               ES_USER_PRESENT=0x4 (UNSUPPORTED: docs say any combination fails, err 87)
+               ES_AWAYMODE_REQUIRED=0x40
+    awake.cs (all v6.x) + darkscreen.ps1 before it: System=0x2, Display=0x4  <- both wrong
 
-Conclusions:
-- The 2026-11-10 "err 87, display power is OS-owned" record is CONFIRMED, not a pwsh
-  artifact: every rejection was produced by compiled C# with correct uint constants.
-- The untested combination from the rebuild rationale (`SYSTEM|DISPLAY` WITHOUT
-  `AWAYMODE`) is also rejected, as is `DISPLAY` alone and non-continuous `DISPLAY` -
-  the "another Modern Standby machine accepted everything" data point does NOT transfer
-  to this box. No accepted request shape exists that includes ES_DISPLAY_REQUIRED here.
-- Per the Step-0 rules this is a hard stop: 0A-2..0A-5 are untestable by definition
-  (nothing to hold), the target design cannot be built, and the F15-injection
-  architecture STAYS. 0B/0C checks (which all required holding the display request)
-  were likewise skipped; no power-plan values were touched; nothing elevated was run.
+Consequences decoded (matrix re-run 14:38:23 with canonical values, each attempt preceded
+by a cont-clear so prev-state reads are clean; ret=0 + lasterr via GetLastError):
+
+    cont|sys        0x80000001 -> ret=0x80000000 ACCEPTED
+    cont|disp       0x80000002 -> ret=0x80000000 ACCEPTED
+    cont|sys|disp   0x80000003 -> ret=0x80000000 ACCEPTED   <- THE rebuild request, ACCEPTED
+    cont|sys|disp|away 0x80000043 -> ACCEPTED
+    disp non-cont   0x00000002 -> ACCEPTED
+    cont|user-present 0x80000004 -> REJECTED err=87          <- reproduces the exact 87 class
+    [v6 called 0x80000006 "sys|disp" - actually disp|USER_PRESENT -> REJECTED err=87
+     (the original "ES_DISPLAY_REQUIRED is rejected here (err 87)" observation)]
+    [v6's HoldBestEffort fallback 0x80000042, LOGGED as "sys+away" - actually
+     DISPLAY|AWAYMODE -> ACCEPTED. Every v6.2+ worker has been holding a REAL
+     ES_DISPLAY request for its whole lifetime - and TUNING-NOTES v6.4.2 already
+     concluded "survival through dark runs was the ES sys+away hold + the
+     unattended-sleep-timeout fix, NOT the keepalive". The surviving hold was a
+     DISPLAY hold; the 2026-11-10 "powercfg lists DISPLAY+AWAYMODE when we request
+     SYSTEM|AWAYMODE" QUIRK was not a section-mapping quirk - the request really WAS
+     display+away.]
+    cont (clear)    -> ACCEPTED
+
+So 0A-1 (acceptance) now PASSES with the canonical request 0x80000003. What acceptance
+cannot prove is HONOURING: v6.4.2 field notes claim the OS still blanked the display at
+the AC 300 s timeout while that (unnamed but real) display hold was live. 0A-2
+(powercfg /requests) and 0A-3 (1-minute AC timeout + 10 min hold, heartbeat + panel) are
+the decisive tests and are scheduled as ONE combined run with the 0B untouched log.
+NOTE for all future code: never trust a flag constant that was copied from the ps1
+lineage; verify against winbase.h / Microsoft Learn.
+
+### 0A-1 first pass (SUPERSEDED, kept to show the trap): harness reused awake's constants
+
+(at 14:31:49) cont|sys=0x80000002 ACCEPTED / cont|sys|disp=0x80000006 REJECTED 87 /
+cont|sys|disp|away=0x80000046 REJECTED 87 / cont|disp=0x80000004 REJECTED 87 /
+disp=0x4 REJECTED 87 / cont|sys|away=0x80000042 ACCEPTED - identical matrix, wrong decoders:
+all the "rejections" contained the 0x4 USER_PRESENT bit, all the "accepts" were DISPLAY
+requests. A blocker believed until the constants were checked against the SDK docs.
 
 ### 0D-14 (read-only, captured anyway): both hidden plan fixes are still in place
 
@@ -57,15 +80,99 @@ events in 4 h** with nothing armed (enter/resume pairs every ~30-90 min: 11:02, 
 11:49-11:50, 12:25, 13:32, 14:02). This box idles into S0ix constantly when unprotected -
 consistent with all prior history, and the reason the keepalive exists.
 
-### What this does NOT resolve (open, orthogonal to the blocker)
+### 0A-2/3/4 combined hold run (14:44:00-14:58:07): PASS - the OS HONOURS the display request
 
-The stuck-black-overlay reports (worker alive, tray Stop works, input does not dismiss):
-the `ApplicationContext(form)`-shows-the-overlay hypothesis (0C-11) and the `isDark`/
-visible desync theory (every hide path gated on `isDark`) were NOT tested - running them
-meant blacking the operator's screen and was deferred with the rest. A hardened-overlay
-revision (visibility as single source of truth, never-throwing tick) is possible WITHOUT
-the display-request design: it changes nothing about the keepalive. Operator decision
-pending (branch `feat/awake-display-request` holds the harness + this note only).
+Setup: elevated `powercfg /setacvalueindex SCHEME_CURRENT SUB_VIDEO VIDEOIDLE 60` +
+`setactive` at ~14:43 (operator UAC), then `step0probe hold --minutes 14` (pid 31828)
+holding canonical `cont|sys|disp` (log: "ES hold cont|sys|disp -> ret(prev)=0x80000000
+ACCEPTED"). Nothing touched between the last UAC input (14:46:50) and the 11-min mark.
+- 0A-2 PASS: elevated `powercfg /requests` 14:46:45 lists
+  `\Device\HarddiskVolume3\src\lmrun\skills\awake\app\step0\bin\step0probe.exe` under BOTH
+  DISPLAY and SYSTEM (AWAYMODE: None - correct for this request).
+- 0A-3 PASS: AC timeout 60 s, no input 14:46:50 -> 14:57:40: **no blank** (0A-4: operator
+  confirmed "normal content, normal brightness" at the 5- and 10-min glances, with
+  AsusOLEDShifter pid 14764 AND PowerToys x7 running the whole time - procs logged at
+  start); 77 heartbeat iterations, gaps 1-11 s, NONE >= 14 s; `events --since-minutes 20`
+  after the run: **0** Kernel-Power 506/507/566 (baseline context below: 36 in the 4 h
+  BEFORE with nothing armed). VIDEOIDLE restored to 300 s (elevated restore, registry
+  re-read 0x12c confirmed).
+- 0A-4 PASS: no AsusOLEDShifter/ArmouryCrate interference while the request is held.
+
+### 0B GetLastInputInfo as a pure human clock: PASS (6,7,9) / PASS (8, on rerun)
+
+From the same untouched log (samples every 1 s):
+- 0B-6/7/9 PASS: idle grew monotonically 0.1 s -> **647.7 s** (14:46:50 -> 14:57:40) with
+  ZERO resets - no external injector (PowerToys/Armoury Crate/AsusOLEDShifter all live),
+  holding the display request does not touch the idle clock, no touchpad/sensor noise.
+- 0B-8 PASS (second, well-timed run only): 15:03:22/37/43/49 pen strokes, 15:04:05/11/15
+  finger taps, 15:04:35 mouse - every group produced GLLII resets. (The first attempt at
+  14:57 reported "only taps registered"; its pen phase collided with the hold's exit at
+  14:58:07 - discarded, the rerun is the evidence.) => touch AND pen advance
+  GetLastInputInfo: the raw-input sink (WM_INPUT/RIDEV_INPUTSINK) is NOT needed.
+
+### 0C-10 overlay from a WMI-spawned process: mouse AND keyboard arrive
+
+`overlay --seconds 75` (WMI out-of-tree spawn like the worker; observer-only probe, it
+logs, never hides - the operator's "stuck, killed with Alt+F4" is EXPECTED probe
+behavior, F4 logged at 15:05:27.9). Form shown foreground=True on its own; Activate() at
+t=3 s kept foreground OURS; WM_MOUSEMOVE streams received while visible with nonzero
+deltas (83/79 nz by tick#3); WM_KEYDOWN reached the form WITHOUT any click (vk=Menu at
+15:05:18, F4 at 15:05:27 = the operator's dismiss); LBUTTONDOWN also received; GLLII
+tracked everything (idle=0.0 during activity). => the wake design can use the form's own
+events plus a GetLastInputInfo backstop; background-spawned did NOT cost keyboard focus.
+
+### 0C-11 keeper-mode bug CONFIRMED: Application.Run(ApplicationContext(f)) shows the overlay
+
+CURRENT v6.4.4 build, `start --minutes 5` (keeper, NO --dark) in an isolated state dir,
+15:07:14: window enumeration 5 s later found a **VISIBLE top-level window** on the worker
+pid (hwnd=4459316, class=WindowsForms10.Window...). Keeper mode has no path that ever
+hides it (all hide paths are gated on isDark/mode=dark), so a keeper run parks a black
+full-screen form that only a stop removes = the operator's stuck-black reports. Root
+cause CONFIRMED. Clean stop worked (EXIT logged, files removed). (The same START log also
+shows the ES line decoded with the old wrong labels: "sys+disp+away=0x00000000;
+sys+away=0x80000000" -> first attempt really was disp|USER_PRESENT rejected 87, fallback
+really was disp|away accepted - live confirmation of the constants bug.)
+
+### 0A-5 real-workload A/B/A with the request held: PASS (dark = lit parity)
+
+taimia `scripts/transcribe.py` on a 90 s clip (test90.wav, 16k mono), llama/Vulkan
+(Qwen3-ASR-1.7B-Q8_0), output identical every run (1089 chars). Note: the gufo LLM server
+stayed running (all phases equally - relative comparison unaffected):
+- A lit  (hold pid, ES held): 15 / 11 / 11 s (warmup first run)
+- B dark (WMI overlay-inner: black + ES on its UI thread): **11 / 11 / 11 s**
+- C lit  again:               10 / 10 / 10 s
+Dark time inside the lit runs' own spread and close to the historical 10.2-10.7 s band
+(the whole series ran ~+0.5-1 s, attributed to the live gufo contention).
+
+### Lock-with-request test (0D-13 evidence): inconclusive by hardware flakiness
+
+15:11:03-15:14:26 and 15:17:20-15:20:08, ES sys|disp held: operator reported Win+L did
+NOT lock the session ("there was no lock") - the 2026-11-10 "LockWorkStation returned
+TRUE yet locked nothing" flakiness class, this time the keystroke itself. Panel stayed
+lit, 0 Kernel-Power events in both windows. => locking WITH the request held is not
+directly proven for the panel-blank question, but zero standby events + locked full-speed
+remains proven since 2026-11-10. OPERATOR DECISION: remove `lockguard.ps1` (see below).
+
+### OPERATOR DECISIONS (2026-11-27, for the rebuild)
+
+1. 0D-12 BATTERY: **(a) release the request on battery, re-take on AC** via
+   SystemEvents.PowerModeChanged + status check (worker keeps running either way).
+2. 0D-13 LOCKGUARD: **remove `lockguard.ps1`** and its SKILL.md mentions; the documented
+   one-line powercfg restore stays in TUNING-NOTES history above.
+3. 0D-14 PLAN FIXES: **demote to history** - both values verified intact today
+   (away-mode AC=1, unattended-timeout AC=0), but SKILL.md stops carrying them as
+   requirements; they live here as history + the revert-risk watchlist only.
+4. Other ps1 fallbacks: kept until deleted (unchanged task scope).
+
+### Open risks accepted for the rebuild
+
+- The honouring proof (0A-3) is 14 min long; long-run behavior (multi-hour) is trusted
+  from the process-lifetime ES request + 2026-11-10 evidence.
+- Lock-session panel behavior untested (operator flakiness above); posture stays
+  "don't lock for zero-light".
+- `cont|sys|disp` + battery rule replaces the accidental `disp|away` hold; away-mode's
+  historical contribution is now unknowable (constants bug), so post-rebuild long-run
+  soak on real jobs is the acceptance gate.
 
 ## Platform context
 
