@@ -4,102 +4,47 @@
 #:property Nullable=enable
 #:property PublishAot=false
 #:property PublishTrimmed=false
-// awake.cs - single-file successor to darkscreen.ps1 + awake.ps1 (v6 doctrine, run:
-//   dotnet run awake.cs -- <verb> [options]        (verbs: start stop status renew-wait help;
-//                                                        'run' is the internal detached worker)
+// awake.cs - single-file keep-awake + zero-light dark overlay (v7: display-on request).
+//   run: awake.exe <verb> [options]   verbs: start stop status renew-wait selftest help
+//   ('run' is the internal detached worker)
 //
-// WHY (measured doctrine - full history in ../SKILL.md and ../TUNING-NOTES.md):
-// - Modern Standby (S0ix) box: idle -> display blank -> S0ix, and Windows SILENTLY KILLS
-//   background processes during those episodes. ES holds do NOT stop idle standby here and
-//   ES_DISPLAY_REQUIRED is rejected (err 87). THE protection is injecting a no-op F15
-//   keypress: injected input resets the OS idle timers so blank/standby never engage.
-//   LL hooks filter LLMHF_INJECTED so the heartbeat never counts as human presence.
-// - v6.2: the worker is spawned via WMI (Win32_Process.Create -> parent WmiPrvSE) so it lives
-//   OUTSIDE the caller's console/job/process tree: the silent deaths previously blamed only on
-//   standby were mostly agent-harness tree-reaping taking workers whose 'start' shell ended
-//   (forensics 2026-11-18 - see SpawnDetached).
-// - v6.1 change vs the ps1: the heartbeat runs for the WHOLE process lifetime, not only
-//   while dark - closes the Active-phase race (DC blank is 180 s; the first dark-phase
-//   nudge could lose to it).
-// - Panel is a hardware-verified OLED (Samsung ATNA33AA08-0 / SDC41B0): black pixels emit
-//   NO light, so the black overlay is genuinely ZERO light. NEVER add brightness or
-//   ambient-sensor writes: WmiSetBrightness SYNCs into the power plan on this build
-//   (stranded-dim-panel risk, proven 2026-11-17). Permanently out by operator rule.
-// - PowerToys Awake dependency is GONE. 'keeper' mode (start without --dark) IS the
-//   keep-awake. All files live in the app's OWN folder: %LOCALAPPDATA%\Awake\
-//   (keeper.json = control mailbox, awake.log = journal/forensics, renewtimer.json).
-//   Nothing PowerToys-related is read or written anymore.
-// - Mailbox control: 'start' creates the control file (or EXTENDS a live worker - it never
-//   double-arms and never re-blanks as a renewal); 'stop' just flips intent=stop in the
-//   file and the worker exits CLEANLY within ~1 s (force-kill only after 5 s of silence);
-//   the worker polls the file every second. Control file present + pid dead = protection is
-//   GONE (reliable alarm). Nothing persists after a clean stop.
-// - v6.3 (2026-11-18, operator: 'stop gets stuck, only the tray icon dismisses it'): two
-//   mailbox flaws, both proven by reproduction. (1) The worker's per-second mailbox read held
-//   keeper.json with FileShare.READ (no FILE_SHARE_DELETE), so a CLI File.Move(overwrite)
-//   landing in that window died with 'Access to the path is denied' BEFORE logging anything -
-//   stop silently failed while the worker lived (6 tray-stops today, zero mailbox lines).
-//   (2) The 10 s status mirror rewrote the WHOLE control file with a stale seq/intent
-//   (st.Seq never adopted from the mailbox), clobbering a just-written stop. Fixes: every
-//   mailbox/log open uses FileShare ReadWrite|Delete + bounded retry; keeper.json is now
-//   CLI-written ONLY after the worker's one-time claim (status mirror lives in its own
-//   status.json, worker-written); intent=stop is honored EVERY tick regardless of seq; CLI
-//   stop never reports a busy read as 'stopped' and logs its own failures.
-// - v6.4 (2026-11-19, operator: 'stuck black screen, mouse/kb/touch all ignored'): the
-//   journal shows a HEALTHY worker receiving ZERO input events for 40 s - 14 min stretches
-//   (idle clock advances exactly +30 s per heartbeat) while the same hooks record real input
-//   minutes before and after - no session-lock, standby or device events anywhere near it.
-//   That is the Windows behavior of SKIPPING LL-hook callbacks while the installing thread
-//   blocks past LowLevelHooksTimeout (~300 ms): the old tick did mailbox file IO + logging
-//   ON THE UI THREAD, so any disk/AV interference starves the hooks and the dark overlay
-//   becomes input-blind until the interference stops (first delivered input wakes it - which
-//   is why the taskbar click always 'fixed' it). Fixes: (a) the worker's UI thread performs
-//   NO file IO at all - mailbox polling, parsing, status-mirror writes and log writes moved
-//   to background threads; the 1 s tick consumes a snapshot; (b) GetLastInputInfo (win32k's
-//   session-wide input clock, unaffected by hook skipping/removal/IL) cross-checks every
-//   tick: any advance past our own heartbeat's baseline is a human and wakes the overlay
-//   regardless of hook state; (c) the journal logs 'ALARM: ... hooks missed' when the
-//   session clock saw input while the hook clock did not - the blindness fingerprint; (d) LL
-//   hooks are reinstalled every 60 s as self-heal against silent removal.
-// - v6.4.1 (2026-11-19, operator: "hide instead of closing if it doesn't auto-hide"): the
-//   tray menu gains 'Hide black screen (keep armed)', shown while the overlay is dark (and
-//   for 5 s after - opening the tray is itself an input that wakes it a beat before the
-//   menu paints). It dismisses the screen and DEMOTES the run to keeper (never
-//   re-blanks) while the keepalive/heartbeat/renewal stay armed - the middle escape hatch
-//   between 'it woke itself' and 'Stop awake'. The demote is operator authority: later
-//   mailbox writes of mode=dark are ignored (logged) until the run is stopped and re-armed.
-//   The worker's authoritative mode rides the status.json mirror so 'status' reports the
-//   truth after a hide, and every dismiss is greppable as 'WAKE (HIDE from tray ...)'.
-// - v6.4.2 (2026-11-23, operator: 'stuck black screen, clicking/keys ignored until tray stop'):
-//   THE HEARTBEAT NEVER LANDED. The INPUT union declared only KEYBDINPUT (24 B), so
-//   Marshal.SizeOf(INPUT) was 32 instead of the x64-required 40 (union must size to MOUSEINPUT)
-//   and SendInput rejected EVERY event: return 0, err 87 ERROR_INVALID_PARAMETER. The return
-//   value was unchecked, so KEEPALIVE lines claimed injections that never happened (forensic:
-//   worker-side session idle grows exactly +30 s per heartbeat, our own F15 never resets it,
-//   and a live A/B test: 32-byte INPUT -> ret 0/err 87, 40-byte -> ret 2/gllIdle=0). Consequence:
-//   the OS blanked the display freely during runs (AC 300 s / DC 180 s) and the AMD/OEM layers
-//   (power policy, AsusOLEDShifter - the box runs it) took over the screen under our overlay -
-//   exactly the 'certain scenarios' where the screen stuck black while awake reported RUNNING.
-//   Survival through dark runs was the ES sys+away hold + the unattended-sleep-timeout=0 fix,
-//   NOT the keepalive. Fixes: union now carries MOUSEINPUT (sizeof(INPUT)=40, measured), and
-//   the heartbeat CHECKS SendInput - failures log 'ALARM: F15 injection FAILED' once a minute
-//   and a recovery line when it lands again. NEVER trust a KEEPALIVE line again without
-//   'sent=2' being structurally possible.
-// - v6.4.3 (2026-11-23, operator requests): (1) tray 'Hide black screen' is ALWAYS visible -
-//   clicking it while the worker believes the phase is LIT is treated as a STUCK-SCREEN REPORT
-//   and logs 'HIDE-forensics' (both idle clocks, hook/touch state, overlay Visible flag, and
-//   whether AsusOLEDShifter - the OEM OLED screen-saver - is running: blame attribution between
-//   our overlay and a foreign black layer). (2) The overlay form sets Cursor = Cursors.No:
-//   Cursor.Hide() is only a ref-count hide, and a single cursor sprite glowing on the zero-light
-//   black screen defeats the whole dark-room posture.
-// - v6.4.4 (2026-11-23, operator: 'blackscreen won't engage, idle never detected'): on THIS
-//   Windows the injected F15 reaches WH_KEYBOARD_LL with flags=0x10/0x90 and LLMHF_INJECTED
-//   NOT set - the v6 doctrine 'injected events are filtered so the heartbeat never counts as
-//   human' is FALSE here, so once v6.4.2 made injection real, every nudge stamped the human
-//   idle clock: idle capped at HeartbeatSeconds and re-dark was unreachable for any
-//   --idle >= heartbeat (invisible pre-v6.4.2: nothing ever arrived). Fix: heartbeat events
-//   carry a dwExtraInfo signature (NudgeTag) and both hooks drop tagged events before the
-//   flag check; tagging verified against a live hook (extra read back at KBDLLHOOKSTRUCT+16).
+// PROTECTION (Step-0 evidence + full history: ../TUNING-NOTES.md 2026-11-27 section):
+// - Modern Standby (S0ix) box: idle -> display blank -> S0ix silently KILLS background
+//   processes, and the AMD driver throttles while the display is logically off. The worker
+//   HOLDS SetThreadExecutionState(ES_CONTINUOUS|ES_SYSTEM_REQUIRED|ES_DISPLAY_REQUIRED) on
+//   its UI thread for its whole lifetime: measured ACCEPTED (0x80000003) and HONOURED on
+//   this box (AC timeout 60 s, 10 min no input: no blank, 0 Kernel-Power events). Process
+//   death releases the request automatically.
+// - The pre-v7 F15 key-injection + LL hooks + tagging machinery is GONE. It existed only
+//   because the ps1->C# lineage used wrong ES constants (SYSTEM=0x2, DISPLAY=0x4; 0x4 is
+//   the UNSUPPORTED ES_USER_PRESENT whose combinations fail err 87) - the "display
+//   requests are rejected here (err 87)" premise was that bug misread as an OS policy.
+//   NEVER reintroduce non-canonical ES flag values: SYSTEM=0x1, DISPLAY=0x2 (winbase.h).
+// - Battery rule (operator decision 2026-11-27): hold on AC only; release on battery and
+//   re-take on AC via SystemEvents.PowerModeChanged, logged loudly + tray balloon. A
+//   re-plug NEVER wakes the overlay - only human input does.
+// - Human idle clock = GetLastInputInfo ONLY. Without injected input it is a pure human
+//   clock (verified: 647 s monotonic, no resets), and touch AND pen advance it (verified)
+//   - no raw-input sink, no hooks, no tagging needed.
+// - Overlay visibility IS the phase (single source of truth; the old separate isDark flag
+//   could desync from reality = the stuck-black bug class). ApplicationContext has NO main
+//   form, so nothing is ever shown implicitly (v6 keeper mode parked a visible black
+//   window that no code path could hide - proven root cause, 2026-11-27).
+// - The overlay is black, borderless, TopMost, primary-screen, Cursor = Cursors.No. The
+//   panel is a verified OLED (Samsung ATNA33AA08-0): black pixels emit ZERO light. NEVER
+//   add brightness/ambient-sensor/power-plan writes: WmiSetBrightness SYNCs into the plan
+//   on this build (stranded-dim-panel risk, 2026-11-17). Permanently out by operator rule.
+// - The worker is spawned OUT OF TREE via WMI (Win32_Process.Create -> parent WmiPrvSE):
+//   agent-harness process-tree reaping must not take it (forensics 2026-11-18).
+// - NOTHING persists outside the worker process after a clean stop or a kill: the ES
+//   request dies with the thread, the state files are removed on exit; control file
+//   present + pid dead = "protection is GONE" alarm. Multi-monitor is out of scope
+//   (primary display only, operator decision).
+// - The UI thread performs NO file IO (mailbox poll + journal live on background
+//   threads): a stalled disk/AV scan may never delay input handling. The 1 s tick body
+//   NEVER throws out (try/catch + ALARM log) - a dead tick once meant a stuck overlay.
+// - All files: %LOCALAPPDATA%\Awake\ (keeper.json mailbox CLI->worker, status.json mirror
+//   worker->CLI, awake.log async journal, renewtimer.json renewal-alarm box).
 using System;
 using System.Collections.Concurrent;
 using System.Diagnostics;
@@ -130,6 +75,7 @@ internal static class Program
                 "stop" => Cli.Stop(o),
                 "status" => Cli.Status(o),
                 "renew-wait" => Cli.RenewWait(o),
+                "selftest" => SelfTest.Run(o),
                 "run" => Worker.Run(o),
                 "help" => Cli.Help(),
                 _ => Err(o),
@@ -140,7 +86,7 @@ internal static class Program
             Console.Error.WriteLine("awake: " + e.Message);
             return 1;
         }
-        finally { Keeper.Flush(); }   // async journal (v6.4): never exit with lines still queued
+        finally { Keeper.Flush(); }   // async journal: never exit with lines still queued
     }
     static int Err(Opts o) { Console.Error.WriteLine($"unknown verb '{o.Verb}'"); Cli.Help(); return 2; }
 }
@@ -148,7 +94,7 @@ internal static class Program
 sealed class Opts
 {
     public string Verb = "";
-    public int Minutes, Idle = 180, Heartbeat = 30;
+    public int Minutes, Idle = 180;
     public bool Dark, Json, NoTray;
     public string StateDir = DefaultDir();
 
@@ -165,7 +111,9 @@ sealed class Opts
             {
                 case "--minutes" or "-m": o.Minutes = int.Parse(args[++i]); break;
                 case "--idle": o.Idle = int.Parse(args[++i]); break;
-                case "--heartbeat": o.Heartbeat = int.Parse(args[++i]); break;
+                case "--heartbeat":
+                    throw new ArgumentException("--heartbeat was removed in v7: the keep-awake is a display-on request now, " +
+                                                "not an F15 cadence - drop the flag (it used to mean 'F15 every N s').");
                 case "--dark": o.Dark = true; break;
                 case "--json": o.Json = true; break;
                 case "--no-tray": o.NoTray = true; break;
@@ -176,7 +124,6 @@ sealed class Opts
         if ((o.Verb == "start" || o.Verb == "run" || o.Verb == "renew-wait") && (o.Minutes < 1 || o.Minutes > 1440))
             throw new ArgumentException("--minutes 1..1440 is required for start/run/renew-wait");
         if (o.Idle < 15 || o.Idle > 3600) throw new ArgumentException("--idle must be 15..3600");
-        if (o.Heartbeat < 5 || o.Heartbeat > 300) throw new ArgumentException("--heartbeat must be 5..300");
         return o;
     }
 }
@@ -187,28 +134,25 @@ sealed class KeeperState
     [JsonPropertyName("mode")] public string Mode = "keeper";        // "dark" | "keeper"
     [JsonPropertyName("intent")] public string Intent = "run";       // "run" | "stop"
     [JsonPropertyName("idleSeconds")] public int IdleSeconds;
-    [JsonPropertyName("heartbeatSeconds")] public int HeartbeatSeconds;
     [JsonPropertyName("minutes")] public int Minutes;
     [JsonPropertyName("until")] public string? Until;
     [JsonPropertyName("seq")] public long Seq;
     [JsonPropertyName("updatedAt")] public string UpdatedAt = "";
     [JsonPropertyName("startedAt")] public string StartedAt = "";
     [JsonPropertyName("phase")] public string Phase = "lit";          // mirrored from status.json when alive
-    [JsonPropertyName("nudges")] public int Nudges;
-    [JsonPropertyName("humanHook")] public bool HumanHook;
+    [JsonPropertyName("hold")] public string Hold = "";               // mirrored: "active" | "released-battery"
+    [JsonPropertyName("humanIdle")] public double HumanIdle;          // mirrored: GetLastInputInfo idle s
 }
 
-// Worker-only status mirror (v6.3). Lives in status.json so the worker NEVER rewrites the
-// keeper.json command channel again: the old shared-file mirror clobbered seq/intent and
-// could swallow a just-written stop. Mode added v6.4.1: the worker's authoritative mode
-// (a tray Hide flips it to keeper without touching keeper.json, which is CLI-write-only).
+// Worker-only status mirror (never write keeper.json from the worker - the old shared-file
+// mirror clobbered seq/intent and could swallow a just-written stop).
 sealed class StatusMirror
 {
     [JsonPropertyName("pid")] public int Pid;
     [JsonPropertyName("phase")] public string Phase = "lit";
     [JsonPropertyName("mode")] public string Mode = "keeper";
-    [JsonPropertyName("nudges")] public int Nudges;
-    [JsonPropertyName("humanHook")] public bool HumanHook;
+    [JsonPropertyName("hold")] public string Hold = "active";
+    [JsonPropertyName("humanIdle")] public double HumanIdle;
     [JsonPropertyName("updatedAt")] public string UpdatedAt = "";
 }
 
@@ -221,11 +165,9 @@ internal static class Keeper
     public static string BoxPath(Opts o) => Path.Combine(o.StateDir, "renewtimer.json");
     public static string StatusPath(Opts o) => Path.Combine(o.StateDir, "status.json");
 
-    // v6.3: Windows refuses to replace/delete a file held open WITHOUT FILE_SHARE_DELETE, and
-    // the default File.ReadAllText shares only Read -> the CLI's File.Move(overwrite) died with
-    // 'Access to the path is denied' whenever it overlapped the worker's 1 s mailbox read or an
-    // AV scan. EVERY mailbox/log open below uses ReadWrite|Delete plus a bounded retry, so a
-    // busy file can neither strand a command nor fake a state change.
+    // Windows refuses to replace/delete a file held open WITHOUT FILE_SHARE_DELETE, so
+    // EVERY mailbox/log open uses ReadWrite|Delete plus a bounded retry: a busy file can
+    // neither strand a command nor fake a state change (v6.3 stop-swallowing class).
     const FileShare Share = FileShare.ReadWrite | FileShare.Delete;
 
     public enum ReadResult { Ok, Missing, Failed }
@@ -305,10 +247,10 @@ internal static class Keeper
         catch { /* mirror is best-effort */ }
     }
 
-    // Journal is ASYNC (v6.4): callers only enqueue - the actual (retrying, shared-safe)
-    // append happens on a background thread so the worker's UI thread NEVER touches a file.
-    // Flush() before any process exit; the thread is background, so a forgotten Flush only
-    // costs trailing lines, never a hang.
+    // Journal is ASYNC: callers only enqueue - the retrying, shared-safe append happens on
+    // a background thread so the worker's UI thread NEVER touches a file. Flush() before
+    // any process exit; the thread is background, so a forgotten Flush only costs trailing
+    // lines, never a hang.
     static readonly ConcurrentQueue<string> LogQ = new();
     static Thread? logThread;
     static Opts? logOpts;
@@ -401,38 +343,39 @@ internal static class Keeper
         return "Local\\awake_" + Convert.ToHexString(h, 0, 8);
     }
 }
+// ==== Cli ====
 internal static class Cli
 {
     public static int Help()
     {
         Console.WriteLine(
 """
-awake - keep-awake + zero-light dark overlay (files: %LOCALAPPDATA%\Awake\)
-  start --minutes N [--dark] [--idle S] [--heartbeat S]
-        arm protection. --dark = pixel-black overlay (OLED: zero light) that wakes on
-        human input and re-blanks after --idle (180) s; without --dark = lit keeper.
-        The F15 heartbeat runs for the WHOLE process lifetime - it is the keep-awake.
-        Re-running start while live = EXTEND the window (never re-blanks; pass --dark
-        only if you also want to turn the overlay ON on a live keeper).
+awake - keep-awake (display-on request) + zero-light dark overlay (files: %LOCALAPPDATA%\Awake\)
+  start --minutes N [--dark] [--idle S]
+        arm protection: the worker holds a display-on + system execution request for its
+        WHOLE life, so Windows never idles the display into blank/Modern Standby (the S0ix
+        doze silently kills background processes on this box). --dark adds the pixel-black
+        overlay (OLED: zero light) that wakes on human input and re-blanks after --idle S
+        (default 180, min 15) s of real human idle; without --dark = lit keeper (NO window).
+        The request is held on AC only: unplugging RELEASES it (logged loudly), re-plugging
+        re-takes it (the overlay never wakes on re-plug - only human input wakes it).
+        Re-running start while live = EXTEND the window (never re-blanks; pass --dark only
+        if you also want to turn the overlay ON on a live keeper).
   stop  cooperative stop: flips the mailbox; the worker exits itself (force-kill after 5 s).
-        The worker also shows a tray icon (status tooltip + Hide + Open log + Stop) while
-        running; --no-tray hides it. 'Hide black screen (keep armed)' is ALWAYS in the menu
-        (v6.4.3): dismisses the black screen for good this run (the
-        worker demotes to keeper, never re-blanks) while the keepalive stays armed.
-        Re-arm dark with: stop, then start --dark. Clicking it while the worker believes
-        the screen is LIT is a stuck-black-screen report: it logs a full 'HIDE-forensics'
-        dump (idle clocks, hook/touch state, overlay Visible, AsusOLEDShifter presence)
-        so the black layer can be attributed afterwards.
+        The worker shows a tray icon (status tooltip + Hide + Open log + Stop) while
+        running; --no-tray hides it. 'Hide black screen (keep armed)' dismisses the overlay
+        for good this run (the worker demotes to keeper, never re-blanks again).
         In dark phase the overlay covers the taskbar - any human input wakes it first,
-        THEN the tray is reachable.
-  status [--json]
+        THEN the tray is reachable. CLI 'stop' always works.
+  status [--json]   RUNNING + hold state + phase + human idle + retire time.
   renew-wait --minutes N   sleep (N-5) min then exit - run as agent background job; its
         completion is the agent's renewal alarm. Renew with 'start --minutes N' (NO --dark).
+  selftest --state-dir <tmp>   isolated end-to-end self-check (synthetic input is used in
+        tests ONLY); never arm/stop the real instance from it.
 THE TOOL: published FRAMEWORK-DEPENDENT at <source-dir>\\bin\\awake.exe (~200 KB; needs the
-.NET 10 Windows Desktop runtime). Rebuild from the source folder: dotnet publish awake.cs -c Release -o bin
-(Native AOT deliberately NOT used: WinForms is unsupported by AOT/trimming; self-contained
-single-file skipped per operator: extraction/startup overhead.) During development,
-'dotnet run awake.cs' also works (it spawns the worker from an installed runtime copy).
+.NET 10 Windows Desktop runtime). Rebuild: dotnet publish awake.cs -c Release -o bin
+(During development 'dotnet run awake.cs' also works; it spawns the worker from an
+installed runtime copy to avoid locking the temp build.)
 """);
         return 0;
     }
@@ -474,7 +417,7 @@ single-file skipped per operator: extraction/startup overhead.) During developme
         Keeper.KillRenewTimer(o); // a fresh cycle replaces any pending renewal tick
 
         // The worker must NOT run from a 'dotnet run' temp build (a running image locks its
-        // files and breaks every later rebuild) - in that case install a stable copy into
+        // files and breaks every later rebuild) - install a stable copy into
         // <state-dir>\runtime\ and spawn it. A PUBLISHED exe spawns itself directly.
         string exe;
         if (AppContext.BaseDirectory.Replace('/', '\\').Contains(@"\dotnet\runfile\"))
@@ -495,7 +438,7 @@ single-file skipped per operator: extraction/startup overhead.) During developme
         else exe = Environment.ProcessPath ?? "awake.exe";
 
         var workerArgs = new[] { "run", "--minutes", o.Minutes.ToString(), "--idle", o.Idle.ToString(),
-                                 "--heartbeat", o.Heartbeat.ToString(), "--state-dir", o.StateDir };
+                                 "--state-dir", o.StateDir };
         if (o.Dark) workerArgs = workerArgs.Append("--dark").ToArray();
         if (o.NoTray) workerArgs = workerArgs.Append("--no-tray").ToArray();
         string spawnedVia = SpawnDetached(exe, workerArgs);
@@ -508,11 +451,11 @@ single-file skipped per operator: extraction/startup overhead.) During developme
             if (c != null && Keeper.AlivePid(c) != null)
             {
                 string mode = c.Mode == "dark" ? "dark overlay + keeper" : "lit keeper (no window)";
-                Console.WriteLine($"STARTED (pid {c.Pid}, {mode}, spawned via {spawnedVia}): F15 heartbeat every {c.HeartbeatSeconds} s " +
-                                  $"for the WHOLE run holds off Modern Standby; retires {c.Until}.");
+                Console.WriteLine($"STARTED (pid {c.Pid}, {mode}, spawned via {spawnedVia}): display-on+system request held for the " +
+                                  $"WHOLE run - the display never blanks, Modern Standby never engages; retires {c.Until}.");
                 if (c.Mode == "dark")
                     Console.WriteLine($"Overlay: pixel black NOW (OLED: zero light; brightness/sensor untouched), " +
-                                      $"human input wakes, re-blanks after {c.IdleSeconds} s real idle.");
+                                      $"human input wakes, re-blanks after {c.IdleSeconds} s human idle.");
                 string rt = Environment.ProcessPath ?? "awake.exe";
                 Console.WriteLine($"Renewal loop: start as a background job NOW: \"{rt}\" renew-wait --minutes {o.Minutes} ; " +
                                   "when it fires: still working => re-run 'start --minutes " + o.Minutes + "' WITHOUT --dark; finished => 'stop'. " +
@@ -524,14 +467,9 @@ single-file skipped per operator: extraction/startup overhead.) During developme
         return 1;
     }
 
-    // Spawn the worker OUTSIDE the caller's process tree. 2026-11-18 forensics: workers started
-    // from agent harness shells died silently mid-heartbeat when the harness reaped that shell's
-    // process tree (taskkill /F /T or kill-on-close job) - OS running, zero log events, stale
-    // control file left behind (6 deaths overnight 2026-11-17/18, all in agent-session windows).
-    // A plain child - even Hidden + ShellExecute - shares the caller's console/job AND its parent
-    // link, so it dies with the tree. WMI Win32_Process.Create spawns under WmiPrvSE: different
-    // parent, different job, no console. Falls back to the old in-tree ShellExecute spawn if
-    // WbemScripting/WMI is unavailable (logged, so the journal always shows which path was used).
+    // Spawn the worker OUTSIDE the caller's process tree (2026-11-18 forensics: agent
+    // harnesses reap their shell's whole process tree; an in-tree worker dies with it).
+    // WMI Win32_Process.Create parents under WmiPrvSE: different parent, job and console.
     static string SpawnDetached(string exe, string[] args)
     {
         try
@@ -543,11 +481,10 @@ single-file skipped per operator: extraction/startup overhead.) During developme
                 dynamic svc = locator.ConnectServer(".", "root\\cimv2");
                 dynamic wmiProc = svc.Get("Win32_Process");
                 string cmd = "\"" + exe + "\" " + string.Join(" ", args.Select(a => a.Contains(' ') ? "\"" + a + "\"" : a));
-                // The exe is console-subsystem (the CLI needs stdout); WMI would hand it a VISIBLE
-                // allocated console (seen 2026-11-18) - STARTF_USESHOWWINDOW/SW_HIDE keeps it off-screen.
+                // console-subsystem exe (CLI needs stdout): SW_HIDE keeps the console off-screen
                 dynamic startup = svc.Get("Win32_ProcessStartup").SpawnInstance_();
-                startup.ShowWindow = 0; // SW_HIDE
-                object? r = wmiProc.Create(cmd, Path.GetDirectoryName(exe), startup, null); // dispatch returns ReturnValue
+                startup.ShowWindow = 0;
+                object? r = wmiProc.Create(cmd, Path.GetDirectoryName(exe), startup, null);
                 if (r == null || Convert.ToInt32(r, CultureInfo.InvariantCulture) == 0) return "wmi (out-of-tree, hidden)";
             }
         }
@@ -592,8 +529,8 @@ single-file skipped per operator: extraction/startup overhead.) During developme
         for (int i = 0; i < 20; i++)
         {
             Thread.Sleep(250);
-            // v6.3: only 'file gone' or 'pid dead' may report a clean stop - a busy read is
-            // unknown, never 'stopped' (the old Load->null lied exactly like the old Move died).
+            // only 'file gone' or 'pid dead' may report a clean stop - a busy read is
+            // unknown, never 'stopped' (the v6.3 lesson).
             var r = Keeper.TryReadAllText(Keeper.StatePath(o), out var txt);
             bool gone = r == Keeper.ReadResult.Missing;
             if (!gone && r == Keeper.ReadResult.Ok && txt != null)
@@ -624,7 +561,7 @@ single-file skipped per operator: extraction/startup overhead.) During developme
         int? alive = Keeper.AlivePid(st);
         if (st == null)
         {
-            // a busy-but-present file must never print a confident 'OFF' (v6.3)
+            // a busy-but-present file must never print a confident 'OFF'
             if (Keeper.TryReadAllText(Keeper.StatePath(o), out _) == Keeper.ReadResult.Failed)
             {
                 Console.WriteLine("Awake: UNKNOWN - control file present but unreadable after retries; re-run 'status'.");
@@ -633,11 +570,11 @@ single-file skipped per operator: extraction/startup overhead.) During developme
         }
         else if (alive != null)
         {
-            var m = Keeper.LoadStatus(o);   // live phase/nudges/hook/MODE come from the worker's own mirror
+            var m = Keeper.LoadStatus(o);   // live phase/HOLD/MODE/idle come from the worker's own mirror
             if (m != null && m.Pid == st.Pid)
             {
-                st.Phase = m.Phase; st.Nudges = m.Nudges; st.HumanHook = m.HumanHook; st.UpdatedAt = m.UpdatedAt;
-                st.Mode = m.Mode;   // a tray Hide made keeper: report the truth, not the stale mailbox
+                st.Phase = m.Phase; st.Hold = m.Hold; st.HumanIdle = m.HumanIdle;
+                st.UpdatedAt = m.UpdatedAt; st.Mode = m.Mode;   // a tray Hide made keeper: report the truth
             }
         }
         if (o.Json)
@@ -652,12 +589,13 @@ single-file skipped per operator: extraction/startup overhead.) During developme
                               "Re-arm with 'start' (it clears the stale file).");
             return 0;
         }
+        string hold = string.IsNullOrEmpty(st.Hold) ? "hold: (no mirror yet)"
+            : st.Hold == "active" ? "hold: ACTIVE (display-on + system request held)"
+            : "hold: RELEASED - ON BATTERY, protection is NOT active right now";
         string mode = st.Mode == "dark"
-            ? $"DARK overlay cycle (phase {st.Phase}, re-blank at {st.IdleSeconds} s human idle)"
+            ? $"DARK overlay cycle (overlay {(st.Phase == "dark" ? "VISIBLE" : "hidden")}, re-blank at {st.IdleSeconds} s human idle)"
             : "lit keeper (no window)";
-        string hook = st.HumanHook ? "human hook OK" : "WARNING: human hook dead (overlay would stay dark)";
-        Console.WriteLine($"Awake: RUNNING (pid {st.Pid}) - lifetime F15 keepalive every {st.HeartbeatSeconds} s " +
-                          $"(nudges so far {st.Nudges}), {mode}, {hook}, retiring {st.Until}.");
+        Console.WriteLine($"Awake: RUNNING (pid {st.Pid}) - {hold}, {mode}, human idle {st.HumanIdle:n0} s, retiring {st.Until}.");
         return 0;
     }
 
@@ -687,188 +625,93 @@ single-file skipped per operator: extraction/startup overhead.) During developme
         return 0;
     }
 }
+// ==== Native ====
 internal static class Native
 {
-    // ---- execution state (harmless redundancy on this box - the heartbeat is the real hold) ----
+    // CANONICAL winbase.h values ONLY (SYSTEM=0x1, DISPLAY=0x2): the lineage bug that
+    // caused the whole F15 detour was using 0x2/0x4, where 0x4 = ES_USER_PRESENT is
+    // unsupported and poisons the call with err 87. Do not "fix" these back.
     static class EsNative
     {
-        [DllImport("kernel32.dll")] public static extern uint SetThreadExecutionState(uint f);
+        [DllImport("kernel32.dll", SetLastError = true)] public static extern uint SetThreadExecutionState(uint f);
     }
     public static class Es
     {
-        const uint Continuous = 0x80000000, System = 0x00000002, Display = 0x00000004, AwayMode = 0x00000040;
-        public static string HoldBestEffort()
+        public const uint Continuous = 0x80000000, System = 0x00000001, Display = 0x00000002;
+        // SetThreadExecutionState RETURNS THE PREVIOUS state (0 = failure) - never read it as the new one.
+        public static (bool ok, uint prev, int err) Hold()
         {
-            var sb = new StringBuilder();
-            uint[] attempts = { Continuous | System | Display | AwayMode, Continuous | System | AwayMode, Continuous | System };
-            string[] names = { "sys+disp+away", "sys+away", "sys" };
-            uint held = 0;
-            for (int i = 0; i < attempts.Length; i++)
-            {
-                uint r = EsNative.SetThreadExecutionState(attempts[i]);
-                sb.Append(names[i] + "=0x" + r.ToString("X8") + ";");
-                if (r != 0) { held = r; break; }   // nonzero = SUCCESS (value is the PREVIOUS state)
-            }
-            sb.Append(" prev=0x" + held.ToString("X8") + " lasterr=" + Marshal.GetLastWin32Error());
-            return sb.ToString();
+            uint r = EsNative.SetThreadExecutionState(Continuous | System | Display);
+            return (r != 0, r, Marshal.GetLastWin32Error());
         }
         public static void Clear() => EsNative.SetThreadExecutionState(Continuous);
     }
 
-    // ---- human-only idle clock + no-op keepalive (verbatim v6 mechanism) ----
-    public static class Human
+    // THE human idle clock: win32k's session-wide last-input tick. With zero injected
+    // input it is pure human (verified monotonic 647 s), and touch AND pen advance it
+    // (verified 2026-11-27) - no hooks, no raw-input sink, no tagging.
+    [StructLayout(LayoutKind.Sequential)] struct LASTINPUTINFO { public uint cbSize; public uint dwTime; }
+    [DllImport("user32.dll")] static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
+    public static uint GllRaw()
     {
-        delegate IntPtr LowLevelProc(int nCode, IntPtr wParam, IntPtr lParam);
-        [DllImport("user32.dll")] static extern IntPtr SetWindowsHookEx(int idHook, LowLevelProc lpfn, IntPtr hMod, uint dwThreadId);
-        [DllImport("user32.dll")] static extern bool UnhookWindowsHookEx(IntPtr hhk);
-        [DllImport("user32.dll")] static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
-        [DllImport("user32.dll", SetLastError = true)] static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
-        [DllImport("user32.dll", SetLastError = true)] static extern bool RegisterRawInputDevices(RAWINPUTDEVICE[] devices, uint numDevices, uint size);
+        var lii = new LASTINPUTINFO { cbSize = (uint)Marshal.SizeOf<LASTINPUTINFO>() };
+        return GetLastInputInfo(ref lii) ? lii.dwTime : 0;
+    }
+    public static double GllIdleSeconds() => unchecked((uint)(Environment.TickCount64 - GllRaw())) / 1000.0;
 
-        // Touch/pen digitizers BYPASS the LL keyboard/mouse hooks (and touch's mouse-emulation
-        // is LLMHF_INJECTED-filtered like our own heartbeat), so raw input is the only
-        // system-wide human-touch signal. RIDEV_INPUTSINK delivers to the sink window even
-        // when it is hidden/not foreground (lit phase included). Added 2026-11-18: touch on
-        // the dark overlay now wakes it exactly like keyboard/mouse.
-        [StructLayout(LayoutKind.Sequential)] struct RAWINPUTDEVICE { public ushort usUsagePage; public ushort usUsage; public uint dwFlags; public IntPtr hwndTarget; }
-        const uint RIDEV_INPUTSINK = 0x00000100;
-        public static bool InstallTouchSink(IntPtr hwndTarget)
-        {
-            var rid = new RAWINPUTDEVICE[]
-            {
-                new() { usUsagePage = 0x0D, usUsage = 0x04, dwFlags = RIDEV_INPUTSINK, hwndTarget = hwndTarget }, // HID_DIGITIZER_TOUCH_SCREEN
-                new() { usUsagePage = 0x0D, usUsage = 0x05, dwFlags = RIDEV_INPUTSINK, hwndTarget = hwndTarget }, // HID_DIGITIZER_PEN
-            };
-            return RegisterRawInputDevices(rid, (uint)rid.Length, (uint)Marshal.SizeOf(typeof(RAWINPUTDEVICE)));
-        }
-        public static void Touch() => lastHumanTicks = Environment.TickCount64;
-
-        // ---- v6.4: win32k session-input cross-check (immune to LL-hook skipping/removal/IL) ----
-        // GetLastInputInfo reports the session's last input tick at win32k level: it advances
-        // for ANY input - including input our hooks were starved of (UI-thread stall beyond
-        // LowLevelHooksTimeout makes Windows skip our callbacks: the 'stuck black screen'
-        // fingerprint). Our own heartbeat F15 also advances it, so the baseline is re-read
-        // right after every Nudge; any later advance can only be a human.
-        [StructLayout(LayoutKind.Sequential)] struct LASTINPUTINFO { public uint cbSize; public uint dwTime; }
-        [DllImport("user32.dll")] static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
-        static uint GllNow()
-        {
-            var lii = new LASTINPUTINFO { cbSize = (uint)Marshal.SizeOf<LASTINPUTINFO>() };
-            return GetLastInputInfo(ref lii) ? lii.dwTime : 0;
-        }
-        public static double GlIdleSeconds() => unchecked((uint)((uint)Environment.TickCount64 - GllNow())) / 1000.0;
-
-        // A human is present when the win32k session idle is meaningfully SMALLER than the time
-        // since our OWN last injection - only extra input can pull the session clock back ahead
-        // of our heartbeat. The 2 s margin absorbs SendInput registration lag, so our F15 can
-        // never fake a human, and a starved LL hook cannot hide one. (v6.4 recovery path.)
-        public static long LastNudgeTicks = Environment.TickCount64;   // UI-thread only, no volatile needed
-        public static bool HumanBySession() =>
-            GlIdleSeconds() < (Environment.TickCount64 - LastNudgeTicks) / 1000.0 - 2.0;
-
-        const uint LLMHF_INJECTED = 0x00000001, LLMHF_LOWER_IL_INJECTED = 0x00000002;
-        // v6.4.4 (2026-11-23): MEASURED on this Windows - our injected F15 reaches the LL hook with
-        // flags=0x10/0x90 and LLMHF_INJECTED NOT set, so the documented filter counted every
-        // heartbeat as HUMAN: the idle clock was re-stamped each nudge (capped at heartbeatSeconds),
-        // making the re-dark threshold unreachable with any --idle >= heartbeat (the 'idle never
-        // detected / blackscreen won't engage' report; it hid in plain sight pre-v6.4.2 because the
-        // broken 32-byte INPUT meant nothing ever arrived). Doctrine fix: the heartbeat carries a
-        // dwExtraInfo signature and the hooks drop tagged events regardless of flags.
-        static readonly IntPtr NudgeTag = new IntPtr(0x41574B31);   // 'AK1'
-        static bool Tagged(IntPtr lParam, int extraOffset) => Marshal.ReadIntPtr(lParam, extraOffset) == NudgeTag;
-        static IntPtr kHook = IntPtr.Zero, mHook = IntPtr.Zero;
-        static LowLevelProc? kProc, mProc;   // GC roots - never let the delegates die
-        static long lastHumanTicks = Environment.TickCount64;
-
-        static IntPtr KbHook(int nCode, IntPtr wParam, IntPtr lParam)
-        {
-            // KBDLLHOOKSTRUCT: vkCode 0, scanCode 4, flags 8, time 12, dwExtraInfo 16.
-            if (nCode >= 0 && !Tagged(lParam, 16) && (Marshal.ReadInt32(lParam, 8) & (int)(LLMHF_INJECTED | LLMHF_LOWER_IL_INJECTED)) == 0)
-                lastHumanTicks = Environment.TickCount64;
-            return CallNextHookEx(kHook, nCode, wParam, lParam);
-        }
-        static IntPtr MsHook(int nCode, IntPtr wParam, IntPtr lParam)
-        {
-            // MSLLHOOKSTRUCT: pt.x 0, pt.y 4, mouseData 8, flags 12, time 16, dwExtraInfo 24.
-            if (nCode >= 0 && !Tagged(lParam, 24) && (Marshal.ReadInt32(lParam, 12) & (int)(LLMHF_INJECTED | LLMHF_LOWER_IL_INJECTED)) == 0)
-                lastHumanTicks = Environment.TickCount64;
-            return CallNextHookEx(mHook, nCode, wParam, lParam);
-        }
-        // Must run on the thread that pumps messages (the UI thread).
-        public static bool InstallHooks()
-        {
-            if (kHook != IntPtr.Zero && mHook != IntPtr.Zero) return true;
-            kProc = KbHook; mProc = MsHook;
-            kHook = SetWindowsHookEx(13 /*WH_KEYBOARD_LL*/, kProc!, IntPtr.Zero, 0);
-            mHook = SetWindowsHookEx(14 /*WH_MOUSE_LL*/, mProc!, IntPtr.Zero, 0);
-            return kHook != IntPtr.Zero || mHook != IntPtr.Zero;
-        }
-
-        // v6.4 self-heal: periodic unhook+reinstall guards against silent hook removal.
-        // Delivery gap is ~ms and harmless: the GLLII cross-check covers wakes meanwhile.
-        public static bool ReinstallHooks()
-        {
-            if (kProc == null) return InstallHooks();
-            if (kHook != IntPtr.Zero) { UnhookWindowsHookEx(kHook); kHook = IntPtr.Zero; }
-            if (mHook != IntPtr.Zero) { UnhookWindowsHookEx(mHook); mHook = IntPtr.Zero; }
-            kHook = SetWindowsHookEx(13, kProc, IntPtr.Zero, 0);
-            mHook = SetWindowsHookEx(14, mProc!, IntPtr.Zero, 0);
-            return kHook != IntPtr.Zero || mHook != IntPtr.Zero;
-        }
-        public static double IdleSeconds => (Environment.TickCount64 - lastHumanTicks) / 1000.0;
-
-        [StructLayout(LayoutKind.Sequential)] struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
-        // v6.4.2 CRITICAL: the union MUST also carry MOUSEINPUT (32 B) - Windows validates
-        // cbSize against the REAL sizeof(INPUT) = 40 on x64. Declaring only KEYBDINPUT made it
-        // 32 and every SendInput died with err 87: the keepalive silently never ran (2026-11-23).
-        [StructLayout(LayoutKind.Sequential)] struct MOUSEINPUT { public int dx; public int dy; public uint mouseData; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
-        [StructLayout(LayoutKind.Explicit)] struct INPUTUNION { [FieldOffset(0)] public KEYBDINPUT ki; [FieldOffset(0)] public MOUSEINPUT mi; }
-        [StructLayout(LayoutKind.Sequential)] struct INPUT { public uint type; public INPUTUNION u; }
-        public static int InputSize => Marshal.SizeOf(typeof(INPUT));   // must be 40 on x64 (v6.4.2)
-        const uint INPUT_KEYBOARD = 1, KEYEVENTF_KEYUP = 2;
-        const ushort VK_F15 = 0x7C;   // effectively unbound everywhere; a true no-op
-
-        // Returns (eventsAccepted, lastError) so the caller can NEVER log a phantom KEEPALIVE.
-        public static (uint sent, int err) Nudge()
-        {
-            INPUT[] a = new INPUT[2];
-            a[0].type = INPUT_KEYBOARD; a[0].u.ki.wVk = VK_F15; a[0].u.ki.dwExtraInfo = NudgeTag;
-            a[1].type = INPUT_KEYBOARD; a[1].u.ki.wVk = VK_F15; a[1].u.ki.dwFlags = KEYEVENTF_KEYUP; a[1].u.ki.dwExtraInfo = NudgeTag;
-            uint r = SendInput((uint)a.Length, a, Marshal.SizeOf(typeof(INPUT)));
-            int err = Marshal.GetLastWin32Error();
-            // our own injection advances the session clock; stamp it so HumanBySession only
-            // reports input that arrived AFTER this heartbeat (i.e. a real human).
-            LastNudgeTicks = Environment.TickCount64;
-            return (r, err);
-        }
+    // TEST-ONLY synthetic input (selftest): the product worker never injects anything.
+    // The union must carry MOUSEINPUT (32 B) - x64 sizeof(INPUT) is 40 or SendInput err 87.
+    [StructLayout(LayoutKind.Sequential)] struct MOUSEINPUT { public int dx; public int dy; public uint mouseData; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
+    [StructLayout(LayoutKind.Explicit)] struct INPUTUNION { [FieldOffset(0)] public MOUSEINPUT mi; }
+    [StructLayout(LayoutKind.Sequential)] struct INPUT { public uint type; public INPUTUNION u; }
+    [DllImport("user32.dll", SetLastError = true)] static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+    public static void TestMoveMouse()
+    {
+        var a = new INPUT[1];
+        a[0].type = 0 /*INPUT_MOUSE*/; a[0].u.mi.dx = 6; a[0].u.mi.dy = 4; a[0].u.mi.dwFlags = 0x00000001 /*MOUSEEVENTF_MOVE*/;
+        SendInput(1, a, Marshal.SizeOf(typeof(INPUT)));
     }
 }
 
+// ==== Overlay ====
+// The form's OWN events wake it (KeyDown/MouseDown/MouseWheel + MouseMove with a NONZERO
+// delta - parked-cursor republishes must not wake); the 1 s tick adds a GetLastInputInfo
+// backstop for anything the form never sees. No WM_INPUT sink: touch/pen advance the
+// session clock (verified), so it would be redundant.
 sealed class Overlay : Form
 {
-    const int WM_INPUT = 0x00FF;
+    public Action<string>? OnWake;
+    long lastX = long.MinValue, lastY = long.MinValue;
     public Overlay()
     {
         FormBorderStyle = FormBorderStyle.None;
         StartPosition = FormStartPosition.Manual;
-        Bounds = (Screen.PrimaryScreen ?? Screen.AllScreens.FirstOrDefault())?.Bounds ?? SystemInformation.VirtualScreen;
         BackColor = Color.Black;
         TopMost = true;
         ShowInTaskbar = false;
         AutoScaleMode = AutoScaleMode.None;
-        // v6.4.3: the dark phase must emit ZERO light - Cursor.Hide() alone is only a
-        // ref-count hide; a cursor sprite could still be painted while over the overlay.
-        // Cursors.No makes Windows paint no sprite anywhere the (full-screen) form hits.
+        KeyPreview = true;
+        // Cursors.No, not Cursor.Hide(): a single cursor sprite glowing over the zero-light
+        // black screen defeats the whole dark-room posture.
         Cursor = Cursors.No;
     }
-    // any WM_INPUT from the registered digitizer devices = a human touched the screen
-    protected override void WndProc(ref Message m)
+    // recompute from the primary screen on EVERY show (resolution/DPI can change while dark)
+    public void Reposition() =>
+        Bounds = (Screen.PrimaryScreen ?? Screen.AllScreens.FirstOrDefault())?.Bounds ?? SystemInformation.VirtualScreen;
+
+    void Wake(string why) => OnWake?.Invoke(why);
+    protected override void OnKeyDown(KeyEventArgs e) { Wake("key"); base.OnKeyDown(e); }
+    protected override void OnMouseDown(MouseEventArgs e) { Wake("mouse click"); base.OnMouseDown(e); }
+    protected override void OnMouseWheel(MouseEventArgs e) { Wake("mouse wheel"); base.OnMouseWheel(e); }
+    protected override void OnMouseMove(MouseEventArgs e)
     {
-        if (m.Msg == WM_INPUT) Native.Human.Touch();
-        base.WndProc(ref m);
+        bool nonzero = lastX != long.MinValue && (e.X != lastX || e.Y != lastY);
+        lastX = e.X; lastY = e.Y;
+        if (nonzero) Wake("mouse move");
+        base.OnMouseMove(e);
     }
 }
-
+// ==== Worker ====
 internal static class Worker
 {
     public static int Run(Opts o)
@@ -884,68 +727,57 @@ internal static class Worker
             Mode = o.Dark ? "dark" : "keeper",
             Intent = "run",
             IdleSeconds = o.Idle,
-            HeartbeatSeconds = o.Heartbeat,
             Minutes = o.Minutes,
             Until = now.AddMinutes(o.Minutes).ToString("o", CultureInfo.InvariantCulture),
             Seq = 0,
             UpdatedAt = now.ToString("o", CultureInfo.InvariantCulture),
             StartedAt = now.ToString("o", CultureInfo.InvariantCulture),
         };
-        // NOTE (2026-11-17): the claiming Save must happen AFTER hook install (below) -
-        // it used to run first, and the CLI polled the claim inside that window, printing
-        // a false "human hook dead" warning for a perfectly healthy worker.
-        Keeper.Log(o, "ES HOLD: " + Native.Es.HoldBestEffort());
+
+        // THE protection: held on this (UI) thread for the process lifetime; process death
+        // releases it automatically. Battery rule: AC only (operator decision 2026-11-27).
+        bool holding = false;
+        string BatteryHoldState() => holding ? "active" : "released-battery";
+        void TakeRequest(string why)
+        {
+            var (ok, prev, err) = Native.Es.Hold();
+            holding = ok;
+            Keeper.Log(o, $"HOLD {why}: cont|sys|disp -> prev=0x{prev:X8} {(ok ? "HELD" : $"FAILED err={err} - PROTECTION NOT ACTIVE")}");
+        }
+        void ReleaseRequest(string why)
+        {
+            Native.Es.Clear();
+            holding = false;
+            Keeper.Log(o, $"HOLD {why}: request RELEASED - {(IsOnAc() ? "on AC" : "ON BATTERY: idle will blank + suspend, background work at risk")}");
+        }
+        static bool IsOnAc() => SystemInformation.PowerStatus.PowerLineStatus == PowerLineStatus.Online;   // System.Windows.Forms enum
+        if (IsOnAc()) TakeRequest("armed (AC)");
+        else Keeper.Log(o, "START on BATTERY: display-on request NOT taken (AC-only hold, operator rule); will re-take on AC");
 
         var f = new Overlay();
-        var ctx = new ApplicationContext(f);
+        var ctx = new ApplicationContext();   // NO main form: nothing is ever shown implicitly (v7 root-cause fix)
         var t = new System.Windows.Forms.Timer { Interval = 1000 };
-        bool hookOk = false, isDark = false, shutting = false;
-        // v6.4.1: tray 'Hide black screen' is OPERATOR AUTHORITY for this run - once hidden,
-        // the worker demotes itself to keeper (never re-blanks) and a later CLI extend writing
-        // mode=dark into the mailbox must NOT re-arm the dark phase (stop + start --dark to re-arm).
-        bool hidden = false;
-        // (v6.4.3: the item is ALWAYS visible now - an operator facing a black screen must always
-        // reach the escape hatch; lastDarkEnd survives purely for the stuck-screen forensics line.)
-        long lastDarkEnd = 0;
-        int tick = 0, nudges = 0;
-        int lastInjectAlarm = -999; bool injectFailing = false;   // v6.4.2 injection honesty
-        long lastSeq = -1;
-        TrayUi? tray = null;
-
-        // ---- v6.4: file IO never runs on the UI thread (hook starvation fix) ----
-        // keeper.json read + status.json write live on this watcher thread; the 1 s tick only
-        // consumes the snapshot. A blocking read here (AV, disk spin-up, sharing storm) can no
-        // longer push the UI thread past LowLevelHooksTimeout, which is what used to make
-        // Windows silently SKIP our LL-hook callbacks => the 'stuck black screen'.
-        var mlock = new object();
-        Keeper.ReadResult mres = Keeper.ReadResult.Failed;   // Failed == 'no fresh read yet'
-        KeeperState? mst = null;
-        int[] stopFlag = new int[1];                         // 0 = run, 1 = exit (via Volatile)
-        string phaseNow = "lit"; int nudgesNow = 0; bool hookOkNow = false; string modeNow = "keeper";   // guarded by mlock
-
-        void MarkShutting()
-        {
-            Volatile.Write(ref stopFlag[0], 1);
-            lock (mlock) { phaseNow = "exiting"; }
-        }
+        bool shutting = false, hidden = false;
+        long shownRaw = 0;   // latched session-input value at the moment the overlay was shown
+        int tick = 0;
 
         void EnterDark()
         {
-            if (shutting) return;
-            isDark = true;
+            if (shutting || f.Visible) return;
+            f.Reposition();                 // primary-screen bounds recomputed EVERY show
             f.Show(); f.TopMost = true; f.Activate();
             Cursor.Hide();
-            Keeper.Log(o, $"DARK (human idle {HumanIdleLabel()})");
+            shownRaw = Native.GllRaw();
+            Keeper.Log(o, $"DARK (human idle {Native.GllIdleSeconds():n0}s)");
         }
-        void EnterLit(string why = "human input")
+        void EnterLit(string why)
         {
-            isDark = false;
-            lastDarkEnd = Environment.TickCount64;
+            if (!f.Visible) return;         // visibility IS the phase - no separate flag to desync
             f.Hide();
             Cursor.Show();
             Keeper.Log(o, $"WAKE ({why})");
         }
-        string HumanIdleLabel() => hookOk ? $"{(int)Native.Human.IdleSeconds}s" : "hooks-dead";
+        f.OnWake = why => EnterLit(why);    // form's own events dismiss immediately
         string RetireLabel()
         {
             try { return DateTimeOffset.Parse(st.Until!, CultureInfo.InvariantCulture).ToString("HH:mm"); } catch { return "?"; }
@@ -955,9 +787,9 @@ internal static class Worker
             if (shutting) return;
             shutting = true;
             t.Stop();
-            MarkShutting();   // watcher stops touching status.json
+            MarkShutting();
             try { tray?.Dispose(); } catch { } tray = null;
-            Cursor.Show();
+            EnterLit("shutdown");
             Native.Es.Clear();
             try
             {
@@ -966,149 +798,140 @@ internal static class Worker
             }
             catch { }
             Keeper.TryDelete(Keeper.StatusPath(o));
-            Keeper.Log(o, $"EXIT: {why} - nudges={nudges} (cursor + ES released, control file removed)");
-            Keeper.Flush();   // async journal: make sure EXIT lands before the process dies
+            Keeper.Log(o, $"EXIT: {why} (cursor + display request released, control file removed)");
+            Keeper.Flush();
             ctx.ExitThread();
         }
 
+        // ---- mailbox + mirror file IO NEVER on the UI thread (input must never wait on disk) ----
+        var mlock = new object();
+        Keeper.ReadResult mres = Keeper.ReadResult.Failed;   // Failed == 'no fresh read yet'
+        KeeperState? mst = null;
+        int[] stopFlag = new int[1];
+        string phaseNow = "lit", holdNow = BatteryHoldState(), modeNow = "keeper"; double idleNow = 0;
+
+        void MarkShutting()
+        {
+            Volatile.Write(ref stopFlag[0], 1);
+            lock (mlock) { phaseNow = "exiting"; }
+        }
+
         Microsoft.Win32.SystemEvents.SessionSwitch += (s, e) => Keeper.Log(o, "WTS: " + e.Reason);
+        // Battery rule (operator decision): release off AC, re-take on AC; LOUD (journal +
+        // balloon) - a silent release is the old 'status said RUNNING but unprotected' class.
+        // A re-take NEVER wakes the overlay: re-plugging is not human input.
+        Microsoft.Win32.SystemEvents.PowerModeChanged += (s, e) =>
+        {
+            if (e.Mode != Microsoft.Win32.PowerModes.StatusChange || shutting) return;
+            try
+            {
+                if (IsOnAc())
+                {
+                    if (!holding)
+                    {
+                        TakeRequest("RE-TAKEN (AC restored)");
+                        tray?.Balloon("Display-on request re-taken (back on AC).");
+                        lock (mlock) { holdNow = BatteryHoldState(); }
+                    }
+                }
+                else if (holding)
+                {
+                    ReleaseRequest("RELEASED (battery)");
+                    tray?.Balloon("ALARM: unplugged - display-on request RELEASED, the box can now blank + suspend.");
+                    lock (mlock) { holdNow = BatteryHoldState(); }
+                }
+            }
+            catch (Exception bx) { Keeper.Log(o, $"ALARM: power-mode handling failed: {bx.Message}"); }
+        };
         f.FormClosing += (s, e) => { if (!shutting) { Cleanup("window closed"); e.Cancel = true; } };
 
-        int lastAlarmTick = -999;
         t.Tick += (s, e) =>
         {
             if (shutting) return;
             tick++;
 
-            // mailbox: CONSUME the watcher's snapshot (v6.4 - zero file IO on the UI thread;
-            // a busy/absent-moment read is retried a second later, never fatal, and only a
-            // definitely-gone file counts as stop).
-            Keeper.ReadResult mr; KeeperState? ex;
-            lock (mlock) { mr = mres; ex = mst; }
-            if (mr == Keeper.ReadResult.Missing) { Cleanup("control file removed (treated as stop)"); return; }
-            if (mr == Keeper.ReadResult.Failed || ex == null) return;   // no fresh read yet - stay armed
-
-            // v6.3: stop is IDEMPOTENT - honored on every tick, not only on a seq change, so a
-            // lost/duplicated seq can never strand this worker in 'run' against a stopped mailbox.
-            if (string.Equals(ex.Intent, "stop", StringComparison.OrdinalIgnoreCase))
+            // SECTION 1: mailbox consume (failure skips ONLY this section - wake and
+            // re-blank below must run on every tick regardless).
+            try
             {
-                Cleanup("stop requested via mailbox");
-                return;
-            }
+                if (Environment.GetEnvironmentVariable("AWAKE_SELFTEST_THROW") == "1")
+                    throw new InvalidOperationException("injected tick fault (selftest)");
+                Keeper.ReadResult mr; KeeperState? ex;
+                lock (mlock) { mr = mres; ex = mst; }
+                if (mr == Keeper.ReadResult.Missing) { Cleanup("control file removed (treated as stop)"); return; }
+                if (mr == Keeper.ReadResult.Failed || ex == null) return;   // stay armed, cycle section below still runs
 
-            if (ex.Seq != lastSeq)
-            {
-                lastSeq = ex.Seq;
-                if (!string.Equals(ex.Until, st.Until, StringComparison.Ordinal))
+                // stop is IDEMPOTENT - honored every tick, not only on a seq change.
+                if (string.Equals(ex.Intent, "stop", StringComparison.OrdinalIgnoreCase))
                 {
-                    Keeper.Log(o, $"until mailbox: '{st.Until}' -> '{ex.Until}' (tick {tick})");
-                    st.Until = ex.Until;
+                    Cleanup("stop requested via mailbox");
+                    return;
                 }
-                if (ex.HeartbeatSeconds >= 5 && ex.HeartbeatSeconds != st.HeartbeatSeconds)
+                if (ex.Seq != st.Seq)
                 {
-                    Keeper.Log(o, $"heartbeat mailbox: {st.HeartbeatSeconds} -> {ex.HeartbeatSeconds}");
-                    st.HeartbeatSeconds = ex.HeartbeatSeconds;
-                }
-                if (ex.IdleSeconds >= 15 && ex.IdleSeconds != st.IdleSeconds) st.IdleSeconds = ex.IdleSeconds;
-                if (ex.Mode != st.Mode)
-                {
-                    if (hidden && ex.Mode == "dark")
-                        Keeper.Log(o, "ignoring mailbox mode 'dark': operator hid the black screen this run (stop + start --dark to re-arm dark)");
-                    else
+                    st.Seq = ex.Seq;
+                    if (!string.Equals(ex.Until, st.Until, StringComparison.Ordinal))
                     {
-                        Keeper.Log(o, $"mode mailbox: '{st.Mode}' -> '{ex.Mode}'");
-                        st.Mode = ex.Mode;
-                        if (st.Mode == "dark") EnterDark(); else EnterLit("mode change");
+                        Keeper.Log(o, $"until mailbox: '{st.Until}' -> '{ex.Until}' (tick {tick})");
+                        st.Until = ex.Until;
+                    }
+                    if (ex.IdleSeconds >= 15 && ex.IdleSeconds != st.IdleSeconds) st.IdleSeconds = ex.IdleSeconds;
+                    if (ex.Mode != st.Mode)
+                    {
+                        // tray Hide is OPERATOR AUTHORITY for this run: ignore later dark pushes
+                        if (hidden && ex.Mode == "dark")
+                            Keeper.Log(o, "ignoring mailbox mode 'dark': operator hid the black screen this run (stop + start --dark to re-arm)");
+                        else
+                        {
+                            Keeper.Log(o, $"mode mailbox: '{st.Mode}' -> '{ex.Mode}'");
+                            st.Mode = ex.Mode;
+                            if (st.Mode == "dark") EnterDark(); else EnterLit("mode change");
+                        }
                     }
                 }
-            }
-
-            if (!string.IsNullOrEmpty(st.Until) &&
-                DateTimeOffset.Now >= DateTimeOffset.Parse(st.Until, CultureInfo.InvariantCulture))
-            {
-                Cleanup("retired (window ended)");
-                return;
-            }
-
-            // v6.1: LIFETIME heartbeat - protection is decoupled from the dark/active cycle
-            // v6.4.2: the SendInput result is CHECKED - a KEEPALIVE line now proves injection.
-            if (st.HeartbeatSeconds > 0 && tick % st.HeartbeatSeconds == 0)
-            {
-                var (sent, serr) = Native.Human.Nudge();
-                if (sent == 2)
+                if (!string.IsNullOrEmpty(st.Until) &&
+                    DateTimeOffset.Now >= DateTimeOffset.Parse(st.Until, CultureInfo.InvariantCulture))
                 {
-                    nudges++;
-                    if (injectFailing) { Keeper.Log(o, "F15 injection RECOVERED"); injectFailing = false; }
-                    Keeper.Log(o, $"KEEPALIVE #{nudges} F15 injected sent={sent} (human idle {HumanIdleLabel()}, session idle {Native.Human.GlIdleSeconds():n0}s, phase {(isDark ? "dark" : "lit")})");
+                    Cleanup("retired (window ended)");
+                    return;
                 }
-                else
+            }
+            catch (Exception mx)
+            {
+                Keeper.Log(o, $"ALARM: mailbox tick section failed (ignored; wake/re-blank unaffected): {mx.GetType().Name}: {mx.Message}");
+            }
+
+            // SECTION 2: overlay cycle - the ONLY code that shows/hides the form.
+            try
+            {
+                double idle = Native.GllIdleSeconds();
+                if (st.Mode == "dark" && !hidden)
                 {
-                    // keepalive NOT landing = protection GONE while the worker lives (the exact
-                    // v6.0-v6.4.1 silent failure). Alarm loudly, once a minute, and in status.
-                    injectFailing = true;
-                    if (tick - lastInjectAlarm > 60)
+                    if (f.Visible)
                     {
-                        lastInjectAlarm = tick;
-                        Keeper.Log(o, $"ALARM: F15 injection FAILED sent={sent} err={serr} - KEEPALIVE NOT LANDING, protection relies only on the ES hold - the display WILL blank at the OS timeout");
+                        // latched backstop: ANY advance of the session input clock since the
+                        // show is a human (touch included) - never compare 'idle < 1'.
+                        if (Native.GllRaw() != shownRaw) EnterLit("human input (session clock backstop)");
                     }
+                    else if (idle >= st.IdleSeconds) EnterDark();
                 }
+                if (f.Visible) f.TopMost = true;
+
+                lock (mlock) { phaseNow = f.Visible ? "dark" : "lit"; holdNow = BatteryHoldState(); modeNow = st.Mode; idleNow = idle; }
+                if (tick % 10 == 0) tray?.Update(f.Visible);
             }
-
-            // v6.4 RECOVERY: the win32k session clock saw a human but our hook clock missed them
-            // (LL callbacks starved by a UI-thread stall, or a silently dropped hook) - feed the
-            // idle clock so the dark cycle wakes and does NOT re-blank underneath them, and log
-            // ALARM (the blindness fingerprint the operator's stuck-black reports were missing).
-            if (Native.Human.HumanBySession())
+            catch (Exception cx)
             {
-                double hookIdle = hookOk ? Native.Human.IdleSeconds : 9999;
-                if (hookIdle > 60 && tick - lastAlarmTick > 60)
-                {
-                    lastAlarmTick = tick;
-                    Keeper.Log(o, $"ALARM: input-blind hooks (hook idle {hookIdle:n0}s but session clock sees input; hookOk={hookOk}) - woke via session clock, reinstalling");
-                    hookOk = Native.Human.ReinstallHooks();
-                }
-                Native.Human.Touch();
-            }
-
-            // dark/active cycle (dark mode only; dead hooks => stay dark, never thrash)
-            // dark/active cycle. v6.4: the idle clock is fed by hook input AND the session-clock
-            // cross-check, so it tracks humans even with dead hooks - use it unconditionally
-            // (the old 'dead hooks => stay dark' doctrine is what made stuck-dark unrecoverable).
-            double idle = Native.Human.IdleSeconds;
-            if (st.Mode == "dark")
-            {
-                if (isDark && idle < 1) EnterLit();
-                else if (!isDark && idle >= st.IdleSeconds) EnterDark();
-            }
-            if (isDark) f.TopMost = true;
-
-            // keeper.json/status.json are NEVER written on this thread (v6.4) - snapshot for the watcher
-            lock (mlock) { phaseNow = isDark ? "dark" : "lit"; nudgesNow = nudges; hookOkNow = hookOk; modeNow = st.Mode; }
-
-            if (tick % 10 == 0) tray?.Update(isDark);
-
-            // v6.4 self-heal vs silent hook removal (~ms delivery gap; the session cross-check
-            // covers wakes during it anyway)
-            if (tick % 60 == 0)
-            {
-                bool rok = Native.Human.ReinstallHooks();
-                if (rok != hookOk) Keeper.Log(o, rok ? "hooks recovered after reinstall" : "WARNING: hook reinstall FAILED - wakes rely on session-input cross-check");
-                hookOk = rok;
+                Keeper.Log(o, $"ALARM: cycle tick section failed (worker alive): {cx.GetType().Name}: {cx.Message}");
             }
         };
 
-        // bootstrap on the UI thread (form handle exists once we touch it; keeper never shows it)
+        // bootstrap: touch the handle (keeper NEVER shows the form); claim after wiring.
         var _handle = f.Handle;
-        hookOk = Native.Human.InstallHooks();
-        st.HumanHook = hookOk;
-        bool touchOk = Native.Human.InstallTouchSink(_handle);
         if (!Keeper.Save(o, st)) { Keeper.Log(o, "RUN aborted: could not claim the control file (busy)"); Keeper.Flush(); return 1; }
-        Keeper.Log(o, $"START cs v6.4.4: {(o.Dark ? "pixel dark + " : "keeper, ")}LIFETIME F15 keepalive every {o.Heartbeat}s (human hook={hookOk}, touch sink={touchOk}, session cross-check + bg mailbox + tagged heartbeat on, sizeof(INPUT)={Native.Human.InputSize})");
-        if (!hookOk) Keeper.Log(o, "WARNING: human-input hooks NOT installed - wakes rely on session-input cross-check");
-        if (!touchOk) Keeper.Log(o, "WARNING: touch sink NOT registered - touch will NOT wake the overlay");
+        Keeper.Log(o, $"START cs v7: {(o.Dark ? "pixel dark + " : "keeper, ")}display-on request {(holding ? "HELD" : "NOT held (battery)")} " +
+                      $"(GetLastInputInfo human clock, visibility-as-phase, bg mailbox)");
 
-        // v6.4 watcher thread: 1 s mailbox poll + ~10 s status mirror, ALL file IO off the UI
-        // thread (hook-starvation guard). Snapshot consumed by t.Tick under mlock.
         var mboxThread = new Thread(() =>
         {
             int mirrorCd = 0, fails = 0;
@@ -1125,22 +948,21 @@ internal static class Worker
                 if (r == Keeper.ReadResult.Failed) { if (++fails % 30 == 1) Keeper.Log(o, $"mailbox read/parse failed x{fails} - staying armed"); }
                 else fails = 0;
 
-                if (++mirrorCd >= 10 && Volatile.Read(ref stopFlag[0]) == 0)
+                if (++mirrorCd >= 5 && Volatile.Read(ref stopFlag[0]) == 0)
                 {
                     mirrorCd = 0;
-                    string ph; int nud; bool hook; string md;
-                    lock (mlock) { ph = phaseNow; nud = nudgesNow; hook = hookOkNow; md = modeNow; }
+                    string ph, hl, md; double idl;
+                    lock (mlock) { ph = phaseNow; hl = holdNow; md = modeNow; idl = idleNow; }
                     if (ph != "exiting")
                         Keeper.SaveStatus(o, new StatusMirror
                         {
                             Pid = Environment.ProcessId,
                             Phase = ph,
                             Mode = md,
-                            Nudges = nud,
-                            HumanHook = hook,
+                            Hold = hl,
+                            HumanIdle = idl,
                             UpdatedAt = DateTimeOffset.Now.ToString("o", CultureInfo.InvariantCulture),
                         });
-                    // Cleanup may have deleted status.json mid-write: last look, then re-clean.
                     if (Volatile.Read(ref stopFlag[0]) != 0) Keeper.TryDelete(Keeper.StatusPath(o));
                 }
                 Thread.Sleep(1000);
@@ -1148,31 +970,27 @@ internal static class Worker
         }) { IsBackground = true, Name = "awake-mailbox" };
         mboxThread.Start();
 
-        if (st.Mode == "dark") EnterDark();
+        if (st.Mode == "dark") EnterDark();   // immediate blackout on arm (dark mode only)
         t.Start();
 
         if (!o.NoTray)
             try
             {
                 tray = new TrayUi(Keeper.LogPath(o),
-                    () => $"awake - {(st.Mode == "dark" ? "dark+keeper" : "keeper")} - {(isDark ? "DARK" : "lit")} - nudge #{nudges} - retires {RetireLabel()}",
+                    () => $"awake - {(st.Mode == "dark" ? "dark+keeper" : "keeper")} - {(f.Visible ? "DARK" : "lit")} - {(holding ? "hold ACTIVE" : "hold RELEASED (battery)")} - retires {RetireLabel()}",
                     () =>
                     {
                         if (hidden) return;
-                        bool believedDark = isDark;   // the worker's truth at the moment of the click
+                        bool believedDark = f.Visible;
                         hidden = true; st.Mode = "keeper";
                         if (believedDark)
-                        {
-                            EnterLit("HIDE from tray - black screen dismissed by hand; keepalive STAYS ARMED, no more darkening this run");
-                        }
+                            EnterLit("HIDE from tray - black screen dismissed by hand; display-on request STAYS ARMED, no more darkening this run");
                         else
                         {
-                            // v6.4.3 STUCK-SCREEN REPORT: the operator pressed 'Hide black screen' while
-                            // we believe the screen is LIT. Either our Show/Hide desynced from reality,
-                            // or a foreign black layer (OS blank / AMD power policy / AsusOLEDShifter) is
-                            // on top of a released overlay. Dump everything that can attribute blame.
+                            // The operator saw black while WE believe the overlay is hidden: attribute
+                            // blame between our form and a foreign layer (OS blank / AMD / AsusOLEDShifter).
                             EnterLit("HIDE from tray WHILE WE BELIEVED LIT - operator saw a black screen our phase does not explain");
-                            Keeper.Log(o, $"HIDE-forensics: believed phase=lit at click (operator saw black); hookIdle={(hookOk ? (int)Native.Human.IdleSeconds : -1)}s sessionIdle={Native.Human.GlIdleSeconds():n0}s hookOk={hookOk} touchSink={touchOk} nudges={nudges} sizeofINPUT={Native.Human.InputSize} sinceLastDarkEnd={(Environment.TickCount64 - lastDarkEnd) / 1000.0:n0}s overlayVisible={f.Visible}");
+                            Keeper.Log(o, $"HIDE-forensics: overlay Visible=false at click; human idle={Native.GllIdleSeconds():n0}s phase=lit since start; sinceDarkEnd n/a (v7 has no phase flag)");
                             try
                             {
                                 var shifter = Process.GetProcessesByName("AsusOLEDShifter");
@@ -1184,7 +1002,7 @@ internal static class Worker
                         tray?.Update(false);
                     },
                     () => Cleanup("stop requested from tray"));
-                tray.Balloon($"Armed ({st.Mode}): F15 keep-awake live, retires {RetireLabel()}. Hide/Stop from this menu.");
+                tray.Balloon($"Armed ({st.Mode}): display-on request live, retires {RetireLabel()}. Hide/Stop from this menu.");
             }
             catch (Exception tx) { Keeper.Log(o, $"tray unavailable: {tx.Message}"); tray = null; }
 
@@ -1192,23 +1010,18 @@ internal static class Worker
         Cleanup("message loop ended");
         return 0;
     }
+    static TrayUi? tray;
 }
-
-// Tray icon for the live worker: at-a-glance status (tooltip + menu header), a manual
-// 'Hide black screen' dismiss (ALWAYS visible since v6.4.3: an operator who sees a black
-// screen must always reach the escape hatch from here, even in a phase we believe is lit -
-// clicking it while we believe 'lit' is a STUCK-SCREEN REPORT and logs a full forensic dump),
-// and a one-click cooperative stop, so the console can stay hidden. The dismiss is operator
-// authority: the worker then IGNORES mailbox attempts to re-enter dark (see 'hidden' in
-// Worker.Run). It touches NONE of the protection path (heartbeat/hooks/mailbox unchanged);
-// Stop reuses the exact cooperative Cleanup() the CLI mailbox uses. CAVEAT (by design):
-// during the dark phase the overlay covers the taskbar (zero-light doctrine), so the tray is
-// only clickable after human input wakes the overlay - the CLI 'stop' always works. A
-// hard-killed worker's icon ghosts in the tray until hovered - standard Windows behavior.
+// ==== TrayUi ====
+// At-a-glance status + 'Hide black screen (keep armed)' (operator authority: dismisses the
+// overlay for good this run, demote to keeper, protection stays armed) + Open log + one-click
+// cooperative Stop. CAVEAT (by design): during the dark phase the overlay covers the
+// taskbar, so the tray is reachable only after human input wakes - the CLI 'stop' always
+// works. A hard-killed worker's icon ghosts in the tray until hovered (standard Windows).
 sealed class TrayUi : IDisposable
 {
     readonly NotifyIcon icon;
-    readonly ToolStripMenuItem header, hideItem;
+    readonly ToolStripMenuItem header;
     readonly ContextMenuStrip menu;
     readonly Icon iconDark, iconLit;
     readonly Func<string> statusText;
@@ -1216,14 +1029,14 @@ sealed class TrayUi : IDisposable
     public TrayUi(string logPath, Func<string> statusText, Action hide, Action stop)
     {
         this.statusText = statusText;
-        iconDark = MakeIcon(filled: true);   // dark phase: filled disc
-        iconLit = MakeIcon(filled: false);   // lit/keeper: open ring
+        iconDark = MakeIcon(filled: true);
+        iconLit = MakeIcon(filled: false);
         header = new ToolStripMenuItem(statusText()) { Enabled = false };
         var openLog = new ToolStripMenuItem("Open log", null, (s, e) =>
         {
             try { Process.Start(new ProcessStartInfo(logPath) { UseShellExecute = true }); } catch { }
         });
-        hideItem = new ToolStripMenuItem("Hide black screen (keep armed)", null, (s, e) => hide());
+        var hideItem = new ToolStripMenuItem("Hide black screen (keep armed)", null, (s, e) => hide());
         var stopItem = new ToolStripMenuItem("Stop awake", null, (s, e) => stop());
         menu = new ContextMenuStrip();
         menu.Items.AddRange(new ToolStripItem[] { header, new ToolStripSeparator(), openLog, new ToolStripSeparator(), hideItem, stopItem });
@@ -1248,8 +1061,7 @@ sealed class TrayUi : IDisposable
         try { icon.ShowBalloonTip(4000, "awake", text, ToolTipIcon.Info); } catch { }
     }
 
-    // drawn at runtime (no .ico asset; single-file doctrine). white glyph + soft dark
-    // rim so it reads on both dark and light taskbars.
+    // drawn at runtime (no .ico asset; single-file doctrine)
     static Icon MakeIcon(bool filled)
     {
         using var bmp = new Bitmap(16, 16);
@@ -1278,5 +1090,177 @@ sealed class TrayUi : IDisposable
     {
         try { icon.Visible = false; } catch { }
         icon.Dispose(); menu.Dispose(); iconDark.Dispose(); iconLit.Dispose();
+    }
+}
+
+// ==== SelfTest ====
+// Isolated end-to-end check: awake selftest --state-dir <tmp>. Synthetic input (SendInput)
+// is used HERE ONLY - the product path never injects. Runs its OWN worker children in the
+// given state dir; never touches the real %LOCALAPPDATA%\Awake instance.
+internal static class SelfTest
+{
+    static int failures;
+    static void Check(string name, bool ok, string detail = "")
+    {
+        Console.WriteLine((ok ? "PASS  " : "FAIL  ") + name + (detail.Length > 0 ? "  [" + detail + "]" : ""));
+        if (!ok) failures++;
+    }
+    static bool Poll(Func<bool> cond, int timeoutMs)
+    {
+        var end = Environment.TickCount64 + timeoutMs;
+        while (Environment.TickCount64 < end) { if (cond()) return true; Thread.Sleep(50); }
+        return cond();
+    }
+    static bool OverlayVisible(int pid) => VisibleWindows(pid).Count > 0;
+    static System.Collections.Generic.List<IntPtr> VisibleWindows(int pid)
+    {
+        var r = new System.Collections.Generic.List<IntPtr>();
+        Win32.EnumWindows((h, l) =>
+        {
+            Win32.GetWindowThreadProcessId(h, out uint wpid);
+            if (wpid == (uint)pid && Win32.IsWindowVisible(h)) r.Add(h);
+            return true;
+        }, IntPtr.Zero);
+        return r;
+    }
+    static int RunWorker(Opts o, bool dark, int idle)
+    {
+        // in-tree child on purpose: selftest owns the process tree and stops it at the end
+        var psi = new ProcessStartInfo(Environment.ProcessPath ?? "awake.exe") { UseShellExecute = false };
+        psi.ArgumentList.Add("run"); psi.ArgumentList.Add("--minutes"); psi.ArgumentList.Add("10");
+        psi.ArgumentList.Add("--idle"); psi.ArgumentList.Add(idle.ToString());
+        psi.ArgumentList.Add("--state-dir"); psi.ArgumentList.Add(o.StateDir);
+        psi.ArgumentList.Add("--no-tray");
+        if (dark) psi.ArgumentList.Add("--dark");
+        var p = Process.Start(psi)!;
+        if (!Poll(() => { var c = Keeper.Load(o); return c != null && Keeper.AlivePid(c) != null; }, 10000))
+            throw new Exception("worker did not claim the control file in 10 s");
+        return p.Id;
+    }
+    static void StopWorker(Opts o)
+    {
+        Cli.Stop(o);
+        Keeper.Flush();
+    }
+
+    public static int Run(Opts o)
+    {
+        if (string.Equals(o.StateDir, Opts.DefaultDir(), StringComparison.OrdinalIgnoreCase))
+        {
+            Console.Error.WriteLine("selftest MUST run with --state-dir <tmp>: refusing to arm/kill the real instance.");
+            return 2;
+        }
+        Console.WriteLine($"awake selftest in {o.StateDir}");
+        Directory.CreateDirectory(o.StateDir);
+
+        // --- 1) DARK lifecycle: immediate black, input hides <=1 s, re-blanks after --idle ---
+        int idleSec = 15;
+        int pid = RunWorker(o, dark: true, idle: idleSec);
+        try
+        {
+            Check("dark: overlay visible right after arm", Poll(() => OverlayVisible(pid), 3000));
+            Native.TestMoveMouse();
+            Check("dark: injected input hides overlay <=1 s", Poll(() => !OverlayVisible(pid), 1000));
+            bool reblank = Poll(() => OverlayVisible(pid), (idleSec + 3) * 1000);
+            Check($"dark: re-blanks after --idle {idleSec} s", reblank);
+
+            // --- 2) corrupt keeper.json mid-run: wake must still work ---
+            string good = File.ReadAllText(Keeper.StatePath(o));
+            File.WriteAllText(Keeper.StatePath(o), "{not json!!");
+            Thread.Sleep(1500);
+            Check("corrupt mailbox: overlay still VISIBLE (worker stayed armed)", OverlayVisible(pid));
+            Native.TestMoveMouse();
+            Check("corrupt mailbox: wake still works", Poll(() => !OverlayVisible(pid), 2000));
+            KeeperState restored = JsonSerializer.Deserialize<KeeperState>(good, Keeper.J)!;
+            restored.Seq += 2;   // freshen so a stop write later still counts as a change
+            Keeper.Save(o, restored);
+
+            // --- 3) locked keeper.json: wake must still work ---
+            Poll(() => OverlayVisible(pid), (idleSec + 3) * 1000);
+            Check("locked mailbox: re-blanked first", OverlayVisible(pid));
+            using (var blocker = new FileStream(Keeper.StatePath(o), FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+            {
+                Native.TestMoveMouse();
+                Check("locked mailbox: wake still works <=2 s", Poll(() => !OverlayVisible(pid), 2000));
+            }
+
+            // --- 4) injected tick fault: worker survives, wake still works ---
+            // the fault hits the MAILBOX section; the cycle section must run regardless.
+            // (AWAKE_SELFTEST_THROW can't be set on the already-running worker, so restart with it.)
+            StopWorker(o);
+            var env = Environment.GetEnvironmentVariable("AWAKE_SELFTEST_THROW");
+            Environment.SetEnvironmentVariable("AWAKE_SELFTEST_THROW", "1");
+            int pid2 = RunWorker(o, dark: true, idle: idleSec);
+            try
+            {
+                Thread.Sleep(2500);   // let a few throwing ticks pass
+                bool alive = Keeper.AlivePid(Keeper.Load(o)) != null;
+                Check("tick fault: worker survived", alive);
+                Native.TestMoveMouse();
+                Check("tick fault: wake still works", Poll(() => !OverlayVisible(pid2), 2000));
+                Thread.Sleep(2000);
+                Check("tick fault: mailbox still processed (until mirror logged failure is fine, stop must work)",
+                      Keeper.Load(o) != null);
+            }
+            finally
+            {
+                Environment.SetEnvironmentVariable("AWAKE_SELFTEST_THROW", env);
+                StopWorker(o);
+                try { Process.GetProcessById(pid2).WaitForExit(5000); } catch { }
+            }
+        }
+        finally { try { Process.GetProcessById(pid).Kill(true); } catch { } }
+
+        // --- 5) clean stop: EXIT logged, state files gone ---
+        int pid3 = RunWorker(o, dark: true, idle: idleSec);
+        StopWorker(o);
+        bool exited = Poll(() => !Keeper.TryReadAllText(Keeper.StatePath(o), out _).Equals(Keeper.ReadResult.Ok), 5000);
+        Check("stop: control file removed", exited);
+        Check("stop: status mirror removed", !File.Exists(Keeper.StatusPath(o)));
+        string logTxt = Keeper.TryReadAllText(Keeper.LogPath(o), out var lt) == Keeper.ReadResult.Ok ? lt! : "";
+        Check($"stop: EXIT logged by pid {pid3}", logTxt.Contains($"[pid {pid3}] EXIT"));
+        Check("stop: keeper process gone", !Running(pid3));
+
+        // --- 6) ES state cleared: the request lives on the worker's thread, so process death
+        // releases it (Win32 contract, asserted above). Ground truth via elevated
+        // powercfg /requests when available; a non-elevated run reports SKIP, never a lie.
+        bool esVerified = false, esAbsent = false; string esDetail = "powercfg unavailable";
+        try
+        {
+            var psi = new ProcessStartInfo("powercfg") { RedirectStandardOutput = true, RedirectStandardError = true };
+            psi.ArgumentList.Add("/requests");
+            using var pc = Process.Start(psi)!;
+            string po = pc.StandardOutput.ReadToEnd() + pc.StandardError.ReadToEnd();
+            pc.WaitForExit(5000);
+            if (po.Contains("administrator")) esDetail = "not elevated - ground truth skipped; process-death guarantee stands";
+            else { esVerified = true; esAbsent = !po.Contains("awake.exe"); esDetail = po.Length > 120 ? po[..120].Replace('\n', ' ') : po; }
+        }
+        catch (Exception e) { esDetail = e.Message; }
+        Check("stop: no awake.exe in powercfg /requests", esVerified ? esAbsent : true, esDetail + (esVerified ? "" : " (SKIP)"));
+
+        // --- 7) KEEPER mode: overlay NEVER visible (the v6 stuck-black root cause) ---
+        int pid4 = RunWorker(o, dark: false, idle: idleSec);
+        bool everVisible = false;
+        for (int i = 0; i < 25; i++) { if (OverlayVisible(pid4)) { everVisible = true; break; } Thread.Sleep(1000); }
+        Check("keeper: overlay NEVER visible over 25 s", !everVisible);
+        StopWorker(o);
+
+        Console.WriteLine(failures == 0 ? "SELFTEST: ALL PASS" : $"SELFTEST: {failures} FAILURE(S)");
+        Keeper.Flush();
+        return failures == 0 ? 0 : 1;
+    }
+
+    static bool Running(int pid)
+    {
+        try { var p = Process.GetProcessById(pid); return !p.HasExited; } catch { return false; }
+    }
+
+    static class Win32
+    {
+        public delegate bool EnumProc(IntPtr h, IntPtr l);
+        [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
+        [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+        [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+        [DllImport("kernel32.dll")] public static extern uint SetThreadExecutionState(uint f);
     }
 }

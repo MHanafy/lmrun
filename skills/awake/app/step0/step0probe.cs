@@ -73,6 +73,7 @@ internal static class Probe
         {
             case "es": return Es();
             case "hold": return Hold(minutes, dir);
+            case "beat": return Beat(minutes);
             case "overlay": return OverlayParent(seconds, dir);
             case "overlay-inner": return OverlayInner(seconds, dir);
             case "events": return Events(Opt(args, "--since-minutes", 60));
@@ -112,6 +113,19 @@ internal static class Probe
             // RETURN VALUE = PREVIOUS state; 0 = the call FAILED.
             Console.WriteLine($"[{Now}] SetThreadExecutionState({name} = 0x{flags:X8}) -> ret=0x{r:X8} {(r != 0 ? "ACCEPTED" : "REJECTED")} lasterr={err}");
         }
+        return 0;
+    }
+
+    // Heartbeat-probe ONLY (no ES hold): observe a worker's window without polluting powercfg /requests.
+    static int Beat(int minutes)
+    {
+        string path = Path.Combine(Path.GetTempPath(), "opencode", "awake-step0",
+            $"beat-{DateTime.Now.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture)}.log");
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        log = new StreamWriter(path) { AutoFlush = true };
+        L($"BEAT START pid={Environment.ProcessId} minutes={minutes} (no ES hold)");
+        RunSampler(minutes * 60);
+        L("BEAT END");
         return 0;
     }
 

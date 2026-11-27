@@ -174,6 +174,55 @@ remains proven since 2026-11-10. OPERATOR DECISION: remove `lockguard.ps1` (see 
   historical contribution is now unknowable (constants bug), so post-rebuild long-run
   soak on real jobs is the acceptance gate.
 
+## 2026-11-27 (cont.): v7 rebuild built, self-tested, docs rewritten
+
+Moved out of SKILL.md/code comments into this history file (v6 doctrine, now ALL
+superseded by v7): v6.1 lifetime heartbeat (whole-process F15, closing the Active-phase
+race); v6.2 out-of-tree WMI spawn (harness tree-reaping forensics 2026-11-18); v6.3
+mailbox flaws (worker held keeper.json with FileShare.READ so CLI File.Move died; the
+10 s status mirror clobbered seq/intent and swallowed stops -> FileShare ReadWrite|Delete
++ retries, status.json split, idempotent stop); v6.4 hook starvation (file IO on the UI
+thread past LowLevelHooksTimeout made Windows SKIP LL callbacks = 'stuck black screen'
+-> background mailbox thread, GLLII session cross-check, 60 s hook reinstall); v6.4.1
+tray 'Hide black screen' operator-authority demote; v6.4.2 the INPUT-union size bug
+(KEYBDINPUT-only struct = 32 B, x64 needs 40 -> every SendInput err 87, heartbeat never
+landed while KEEPALIVE lines claimed it did); v6.4.3 always-visible Hide + HIDE-forensics
++ Cursors.No; v6.4.4 LLMHF_INJECTED does NOT flag our injected F15 on this Windows ->
+dwExtraInfo NudgeTag filtering. v7 deletes the entire injection/hook/tagging stack (the
+premise for it was the ES-constants bug above), keeps: state dir + async journal, the
+keeper.json mailbox contract (atomic CLI writes, share-safe reads, idempotent stop,
+watcher-thread file IO), the tray (status/Hide/Open log/Stop), renew-wait, WMI spawn,
+mutex, invariant-culture dates, all CLI verbs.
+
+v7 changes beyond the target design, per operator (decisions recorded 2026-11-27):
+- `--heartbeat` is a HARD ERROR (not accept-and-warn).
+- Battery release/re-take logs loudly (journal + tray balloon).
+- `lockguard.ps1`, `awake.ps1`, `darkscreen.ps1`, `renewtimer.ps1` DELETED (their doctrine
+  is fully documented in this file; git history has the code).
+- Away-mode/unattended-timeout plan fixes DEMOTED from SKILL.md requirements to history
+  (still verified intact today; revert-risk watchlist above still applies to debuggers).
+- `status` now reports RUNNING + hold state (active/released-battery) + overlay phase +
+  human idle + retire time; KEEPALIVE/sent=2 doctrine retired; phase lines are `DARK`
+  and `WAKE (<reason>)`; tick body can never throw (two guarded sections; mailbox failure
+  skips only mailbox handling - enforced and test-proven).
+
+SELFTEST OUTPUT (published build, `%TEMP%\opencode\awake-selftest`, 2026-11-27):
+
+    PASS  dark: overlay visible right after arm
+    PASS  dark: injected input hides overlay <=1 s
+    PASS  dark: re-blanks after --idle 15 s
+    PASS  corrupt mailbox: overlay still VISIBLE (worker stayed armed)
+    PASS  corrupt mailbox: wake still works
+    PASS  locked mailbox: re-blanked first
+    PASS  locked mailbox: wake still works <=2 s
+    PASS  tick fault: worker survived
+    PASS  tick fault: wake still works
+    PASS  tick fault: mailbox still processed ...
+    PASS  stop: control file removed / status mirror removed / EXIT logged / keeper gone
+    PASS  stop: no awake.exe in powercfg /requests  [SKIP when not elevated]
+    PASS  keeper: overlay NEVER visible over 25 s          <- v6 bug class regression test
+    SELFTEST: ALL PASS
+
 ## Platform context
 
 - Modern AMD OLED laptop (Ryzen AI Max-class APU with integrated Radeon
