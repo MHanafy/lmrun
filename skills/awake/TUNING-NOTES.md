@@ -3,6 +3,70 @@
 Human-facing documentation. NOT agent instructions. Written 2026-11-09 after the
 original keep-awake investigation; read this when tuning the skill itself.
 
+## 2026-11-27: Step-0 verification of the "display-on request" rebuild - BLOCKED at 0A-1
+
+Plan under test (operator task): drop the F15 injection machinery and instead hold
+`SetThreadExecutionState(ES_CONTINUOUS|ES_SYSTEM_REQUIRED|ES_DISPLAY_REQUIRED)` for the
+worker's lifetime. Step 0 was run FIRST on the ProArt, before any product code, with a
+throwaway C# harness (`app/step0/step0probe.cs`, branch `feat/awake-display-request`;
+modes `es` / `hold` / `overlay` / `events`). All ES flag math in C# - the pwsh 7.6.9
+hex-literal bug above cannot contaminate these results. Worker verified OFF before
+testing (`status` -> OFF, no keeper.json). On AC (Win32_Battery status=2), lid open,
+`AsusOLEDShifter` pid 14764 running (Armoury Crate not running).
+
+### 0A-1 (BLOCKER): FAIL - ES_DISPLAY_REQUIRED is rejected on this box, every variant
+
+Full rejection matrix, 2026-11-27 14:31:49 + 14:32:19 (return value = PREVIOUS state,
+0 = rejected; lasterr via GetLastError after rejection):
+
+    SetThreadExecutionState(cont|sys            = 0x80000002) -> ret=0x80000000 ACCEPTED lasterr=0
+    SetThreadExecutionState(cont|sys|disp       = 0x80000006) -> ret=0x00000000 REJECTED lasterr=87
+    SetThreadExecutionState(cont|sys|disp|away  = 0x80000046) -> ret=0x00000000 REJECTED lasterr=87
+    SetThreadExecutionState(cont|disp           = 0x80000004) -> ret=0x00000000 REJECTED lasterr=87
+    SetThreadExecutionState(disp non-continuous = 0x00000004) -> ret=0x00000000 REJECTED lasterr=87
+    SetThreadExecutionState(cont|sys|away       = 0x80000042) -> ret=0x80000002 ACCEPTED lasterr=0
+    SetThreadExecutionState(cont clear)                       -> ret=0x80000042 ACCEPTED lasterr=0
+
+Conclusions:
+- The 2026-11-10 "err 87, display power is OS-owned" record is CONFIRMED, not a pwsh
+  artifact: every rejection was produced by compiled C# with correct uint constants.
+- The untested combination from the rebuild rationale (`SYSTEM|DISPLAY` WITHOUT
+  `AWAYMODE`) is also rejected, as is `DISPLAY` alone and non-continuous `DISPLAY` -
+  the "another Modern Standby machine accepted everything" data point does NOT transfer
+  to this box. No accepted request shape exists that includes ES_DISPLAY_REQUIRED here.
+- Per the Step-0 rules this is a hard stop: 0A-2..0A-5 are untestable by definition
+  (nothing to hold), the target design cannot be built, and the F15-injection
+  architecture STAYS. 0B/0C checks (which all required holding the display request)
+  were likewise skipped; no power-plan values were touched; nothing elevated was run.
+
+### 0D-14 (read-only, captured anyway): both hidden plan fixes are still in place
+
+Registry `HKLM\SYSTEM\CurrentControlSet\Control\Power\User\PowerSchemes\
+db6638c8-3605-4d77-aa4d-df84a49947ac (PD_Standard)\238c9fa8-...`:
+- Allow Away Mode Policy `25dfa149-...`: ACSettingIndex = **1** (expected 1) - intact.
+- System unattended sleep timeout `7bc4a2f9-...`: ACSettingIndex = **0** (expected 0) - intact.
+- Console-lock display-off `8ec4b3a5-...` (SUB_VIDEO): no per-plan override under the
+  user PowerSchemes key (asus-set 60 s lives elsewhere / hidden from `powercfg /query`).
+- Current AC display idle timeout (VIDEOIDLE) = 0x12c (300 s); DC = 0xb4 (180 s) -
+  never modified during Step 0.
+
+### Background noise observation (why 0A-3 would have been noisy anyway)
+
+`step0probe events --since-minutes 240` at 14:33 found **36 Kernel-Power 506/507/566
+events in 4 h** with nothing armed (enter/resume pairs every ~30-90 min: 11:02, 11:30,
+11:49-11:50, 12:25, 13:32, 14:02). This box idles into S0ix constantly when unprotected -
+consistent with all prior history, and the reason the keepalive exists.
+
+### What this does NOT resolve (open, orthogonal to the blocker)
+
+The stuck-black-overlay reports (worker alive, tray Stop works, input does not dismiss):
+the `ApplicationContext(form)`-shows-the-overlay hypothesis (0C-11) and the `isDark`/
+visible desync theory (every hide path gated on `isDark`) were NOT tested - running them
+meant blacking the operator's screen and was deferred with the rest. A hardened-overlay
+revision (visibility as single source of truth, never-throwing tick) is possible WITHOUT
+the display-request design: it changes nothing about the keepalive. Operator decision
+pending (branch `feat/awake-display-request` holds the harness + this note only).
+
 ## Platform context
 
 - Modern AMD OLED laptop (Ryzen AI Max-class APU with integrated Radeon
